@@ -43,7 +43,7 @@ def setupApp() {
 
 		section("Vent control parameters:") {
         
-        	input name: "tempControl", type: "bool", title: "Actively manage room/zone temps?", defaultValue: true, required: true, refreshAfterSelection: true
+        	input name: "tempControl", type: "bool", title: "Actively manage room/zone temps?", defaultValue: false, required: true, refreshAfterSelection: true
 			input name: "followMe", type: "capability.thermostat", title: "Follow temps on this thermostat", multiple: false, required: false
 
 			paragraph ""
@@ -76,7 +76,19 @@ def initialize() {
     
     atomicState.lastTime = ""
     atomicState.checking = false
+    atomicState.ventChanged = true
+    atomicState.timeHandlerLast = false
     
+// Get the latest values from all the devices we care about BEFORE we subscribe to events...this avoids a race condition at installation 
+// & reconfigure time
+
+    ventSwitch.refresh()					// get the current / latest status of everything
+    atomicState.ventChanged = false		// just polled for the latest, don't need to poll again until we change the setting (battery saving)
+
+	thermometer.refresh()				// get the latest temperature from the room
+    pollThermostats()					// and the latest status from the thermostats
+    runIn( 600, timeHandler, [overwrite: true] )  // schedule another poll in 10 minutes (assume things are quiet)
+
 // Since we have to poll the thermostats to get them to tell us what they are doing, we need to track events that might indicate
 // one of the zones has changed from "idle", so we subscribe to events that could indicate this change. Ideally, we don't have to also
 // use scheduled polling - temp/humidity changes around the house should get us checking frequently enough - and at more usefule times
@@ -85,9 +97,9 @@ def initialize() {
 	subscribe(thermostatTwo, "thermostatOperatingState", tHandler)
     
     subscribe(thermometer, "temperature", tempHandler)
-    subscribe(thermometer, "humidity", tempHandler)					// humidty may change before temp
+    subscribe(thermometer, "humidity", tempHandler)					// humidty may change before temp (assume a temp/humidity device)
     
-    if (followMe) {
+    if (tempControl) {
     	subscribe(followMe, "heatingSetpoint", tHandler)
         subscribe(followMe, "coolingSetpoint", tHandler)
     }
@@ -95,12 +107,8 @@ def initialize() {
     	subscribe(trackTempChanges, "temperature", tempHandler)		// other thermometers may send temp change events sooner than the room
     }
 
-    ventSwitch.poll()					// get the current / latest status of everything
-    thermometer.refresh()
-    pollThermostats()
-    runIn( 600, timeHandler, [overwrite: true] )  // schedule a poll in 10 minutes if things are quiet
-    
-    checkOperatingStates()				// and setup for where we are now
+// Let the event handlers do the first check
+	checkOperatingStates()				// and finally, setup the vents for our current state
 }
 
 def tHandler( evt ) {
@@ -119,41 +127,47 @@ def checkOperatingStates() {
         return
     }
     atomicState.checking = true
-    log.info "Checking..."
+    log.info "Checking"
     
 	def activeNow = 0
     def stateNow = 'idle'
     
     def opStateOne = thermostatOne.currentValue('thermostatOperatingState')
-//    log.debug "T1 $opStateOne"
 	if (opStateOne != 'idle') {
     	activeNow = activeNow + 1
         stateNow = opStateOne
     }
     
     def opStateTwo = thermostatTwo.currentValue('thermostatOperatingState')
-//    log.debug "T2 $opStateTwo"
 	if ( opStateTwo != 'idle') {
     	activeNow = activeNow + 1
        	stateNow = opStateTwo
     }
 
-	log.trace "stateNow: $stateNow, activeNow: $activeNow"
+	log.trace "stateNow: $opStateOne $opStateTwo $stateNow, activeNow: $activeNow"
     def fooState = "$stateNow $activeNow"
     
 	if (fooState != state.lastTime) {
     	atomicState.lastTime = fooState
-    	ventSwitch.poll()
+    	if (state.ventChanged) {					// if we changed the vent last time, poll to make sure it's still set
+        	ventSwitch.poll()
+            atomicState.ventChanged = false
+        }
         if (tempControl) {
         	thermometer.refresh()					// be sure we are working with the current temperature
         }
          
     	log.info "${ventSwitch.device.label} is ${ventSwitch.currentLevel}%"
-    	if (activeNow == 1) {
+        
+        if (activenow == 0) {								// (re)schedule the next timed poll for 10 minutes if we just switched to both being idle
+        	runIn( 600, timeHandler, [overwrite: true] )  	// it is very unlikely that heat/cool will come on in next 5 minutes
+        }
+    	else if (activeNow == 1) {
             if (stateNow == "cooling") {				// we always have to dump extra cold air when only 1 zone open
     			if ( ventSwitch.currentLevel < 99 ) {
         			log.trace "Cooling, 99% vent"
         			ventSwitch.setLevel(99 as Integer)
+                    atomicState.ventChanged = true
                 }
         	}
             else if (stateNow == "heating") {
@@ -164,43 +178,48 @@ def checkOperatingStates() {
     			if ( ventSwitch.currentLevel != heatLevel ) {
         			log.trace "Heating, ${heatLevel}% vent"
         			ventSwitch.setLevel(heatLevel as Integer)
+                    atomicState.ventChanged = true
         		}  		
             }
             else if (stateNow == "fan only") {
-            	def fanLevel = 50
+            	def fanLevel = 10
      			if ( ventSwitch.currentLevel != fanLevel ) {
         			log.trace "Fan Only, ${fanLevel}% vent"
         			ventSwitch.setLevel(fanLevel as Integer)
+                    atomicState.ventChanged = true
                 }
             }
         }
     	else if (activeNow == 2) {
 			if (stateNow == "cooling") {
-            	def coolLevel = 0
+            	def coolLevel = 0				// no cooling unless we're managing the temperature
                 if (tempControl) {
-                	if (thermometer.currectTemperature > followMe.currentValue("coolingSetPoint") ) { coolLevel = 30 }
+                	if (thermometer.currectTemperature > followMe.currentValue("coolingSetPoint") ) { coolLevel = 99 }
                 }
     			if ( ventSwitch.currentLevel != coolLevel ) {
         			log.trace "Dual cooling, ${coolLevel}% vent"
         			ventSwitch.setLevel(coolLevel as Integer)
+                    atomicState.ventChanged = true
         		}
             }
             else if (stateNow == "heating") {
-            	def heatLevel = 0
+            	def heatLevel = 0				// no heating unless we're managing the temperature
                 if (tempControl) {
-                	if ( thermometer.currentTemperature < followMe.currentValue("heatingSetPoint") ) { heatLevel = 30 }
+                	if ( thermometer.currentTemperature < followMe.currentValue("heatingSetPoint") ) { heatLevel = 99 }
                 }
     			if ( ventSwitch.currentLevel != heatLevel ) {
-        			log.trace "Heating, ${heatLevel}% vent"
+        			log.trace "Dual heating, ${heatLevel}% vent"
         			ventSwitch.setLevel(heatLevel as Integer)
+                    atomicState.ventChanged = true
         		}  		
             }
             else if (stateNow == "fan only") {
-            	def fanLevel = 0
+            	def fanLevel = 10				// no fan unless we're managing the temperature (then only a little)
                 if (tempControl) { fanLevel = 30 }
      			if ( ventSwitch.currentLevel != fanLevel ) {
-        			log.trace "Fan Only, ${fanLevel}% vent"
+        			log.trace "Dual fan only, ${fanLevel}% vent"
         			ventSwitch.setLevel(fanLevel as Integer)
+                    atomicState.ventChanged = true
                 }
             }
     	}
@@ -212,24 +231,47 @@ def checkOperatingStates() {
 
 def tempHandler(evt) {
 	log.trace "tempHandler $evt.device.label $evt.name: $evt.value"
+    
+    atomicState.timeHandlerLast = false
 
 // Limit polls to no more than 1 per 5 minutes
 	if (secondsPast( state.lastPoll, 300)) {
     	log.trace "tempHandler polling"
         pollThermostats()
-        runIn( 300, timeHandler, [overwrite: true] )  // schedule a poll in no less than 5 minutes after this one
+        runIn( 300, timeHandler, [overwrite: true] )	// schedule a poll in no less than 5 minutes after this one
+    }
+
+// if we are managing the temperature, check if we've reached the target when the temp changes in the room
+    if (tempControl) { 									
+    	if ((evt.device.label == thermometer.label) && (evt.name == "temperature")) {
+        	checkOperatingStates()
+        }
     }
 }
+
 def timeHandler() {
     	log.trace "timeHandler polling"
+        
+        if (state.timeHandlerLast) {
+        	if (state.checking) {
+        		atomicState.checking = false				// hack to ensure we do get locked out by a missed state change (happens)
+            }
+        	atomicState.timeHandlerLast = false			// essentially, if timehandler initiates the poll 2 times in a row while checking=true, reset chacking
+        }
+        else {
+        	if (state.checking) {
+            	atomicState.timeHandlerLast = true
+            }
+        }
+        
     	pollThermostats()
         runIn( 600, timeHandler, [overwrite: true] )  // schedule a poll in 10 minutes if things are quiet
 }
 
 def pollThermostats() {
-	atomicState.lastPoll = new Date().time
-    thermostatOne.poll()
+	thermostatOne.poll()
     thermostatTwo.poll()
+    atomicState.lastPoll = new Date().time
 }
 
 //check last message so thermostat poll doesn't happen all the time
