@@ -1,7 +1,7 @@
 /**
  *  Green Smart HVAC  Vent
  *
- *  Copyright 2014 Barry A. Burke
+ *  Copyright 2015 Barry A. Burke
  *
  *
  * For usage information & change log: https://github.com/SANdood/Green-Smart-HVAC-Vent
