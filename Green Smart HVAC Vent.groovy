@@ -1,7 +1,7 @@
 /**
  *  Green Smart HVAC  Vent
  *
- *  Copyright 2015 Barry A. Burke
+ *  Copyright 2014 Barry A. Burke
  *
  *
  * For usage information & change log: https://github.com/SANdood/Green-Smart-HVAC-Vent
@@ -34,17 +34,25 @@ def setupApp() {
 	dynamicPage(name: "setupApp", title: "Smart HVAC Vent Setup", install: true, uninstall: true) {
 
 		section("HVAC Vent Controls") {
-			input name: "ventSwitch", type: "capability.switchLevel", title: "Vent contrtoller?", multiple: false, required: true
-			input name: "thermometer", type: "capability.temperatureMeasurement", title: "Room thermometer?", multiple: false, required: true
-			input name: "thermostatOne", type: "capability.thermostat", title: "1st Thermostat", multiple: false, required: true
-			input name: "thermostatTwo", type: "capability.thermostat", title: "2nd Thermostat", multiple: false, required: true
-            input name: "trackTempChanges", type: "capability.temperatureMeasurement", title: "Track temp change events?", multiple:true, required: false
+			input name: "ventSwitch", type: "capability.switchLevel", title: "Vent controller?", multiple: false, required: true
+            input name: "pollVent", type: "bool", title: "Poll this vent (for setLevel state)?", defaultValue: false, required: true
+            input name: "minVent", type: "decimal", title: "Minimum vent level?", defaultValue: "10", required: true
+            
+            paragraph ""
+            input name: "thermometer", type: "capability.temperatureMeasurement", title: "Room thermometer?", multiple: false, required: true
+			
+            paragraph ""
+            input name: "thermostatOne", type: "capability.thermostat", title: "1st Thermostat", multiple: false, required: true
+			input name: "thermostatTwo", type: "capability.thermostat", title: "2nd Thermostat", multiple: false, required: false  // allow for tracking a single zone only
+            input name: "pollTstats", type: "bool", title: "Poll these thermostats? (for state changes)?", defaultValue: true, required: true
+            
+            input name: "trackTempChanges", type: "capability.temperatureMeasurement", title: "Track temp change events elsewhere?", multiple:true, required: false
 		}
 
 		section("Vent control parameters:") {
         
         	input name: "tempControl", type: "bool", title: "Actively manage room/zone temps?", defaultValue: false, required: true, refreshAfterSelection: true
-			input name: "followMe", type: "capability.thermostat", title: "Follow temps on this thermostat", multiple: false, required: false
+			input name: "followMe", type: "capability.thermostat", title: "Follow temps on this thermostat", multiple: false, required: false, defaultValue: "${thermostatOne}"
 
 			paragraph ""
 			input name: "modeOn",  type: "mode", title: "Enable only in specific mode(s)?", multiple: true, required: false
@@ -74,7 +82,7 @@ def updated() {
 def initialize() {
 	log.debug "Initializing"
     
-    atomicState.lastTime = ""
+    atomicState.lastStatus = ""
     atomicState.checking = false
     atomicState.ventChanged = true
     atomicState.timeHandlerLast = false
@@ -82,25 +90,28 @@ def initialize() {
 // Get the latest values from all the devices we care about BEFORE we subscribe to events...this avoids a race condition at installation 
 // & reconfigure time
 
-    ventSwitch.refresh()					// get the current / latest status of everything
+	ventSwitch.setLevel(minVent as Integer)
+    if (pollVent) { ventSwitch.refresh() }	// get the current / latest status of everything
     atomicState.ventChanged = false		// just polled for the latest, don't need to poll again until we change the setting (battery saving)
 
 	thermometer.refresh()				// get the latest temperature from the room
-    pollThermostats()					// and the latest status from the thermostats
-    runIn( 600, timeHandler, [overwrite: true] )  // schedule another poll in 10 minutes (assume things are quiet)
+    if (pollTstats) { 
+    	pollThermostats()
+    	runIn( 600, timeHandler, [overwrite: true] )  // schedule another poll in 10 minutes (assume things are quiet)
+    }
 
 // Since we have to poll the thermostats to get them to tell us what they are doing, we need to track events that might indicate
 // one of the zones has changed from "idle", so we subscribe to events that could indicate this change. Ideally, we don't have to also
 // use scheduled polling - temp/humidity changes around the house should get us checking frequently enough - and at more usefule times
 	
 	subscribe(thermostatOne, "thermostatOperatingState", tHandler)
-	subscribe(thermostatTwo, "thermostatOperatingState", tHandler)
+	if (thermostatTwo) { subscribe(thermostatTwo, "thermostatOperatingState", tHandler) }
     
     subscribe(thermometer, "temperature", tempHandler)
     subscribe(thermometer, "humidity", tempHandler)					// humidty may change before temp (assume a temp/humidity device)
     
     if (tempControl) {
-    	subscribe(followMe, "heatingSetpoint", tHandler)
+    	subscribe(followMe, "heatingSetpoint", tHandler)			// Need to know when these change (night, home, away, etc.)
         subscribe(followMe, "coolingSetpoint", tHandler)
     }
     if (trackTempChanges) {
@@ -108,7 +119,7 @@ def initialize() {
     }
 
 // Let the event handlers do the first check
-	checkOperatingStates()				// and finally, setup the vents for our current state
+	checkOperatingStates()				// and finally, setup the vent for our current state
 }
 
 def tHandler( evt ) {
@@ -122,7 +133,7 @@ def tHandler( evt ) {
 
 def checkOperatingStates() {
 
-	if (state.checking) { 
+	if (atomicState.checking) { 
     	log.info "Already checking"
         return
     }
@@ -138,42 +149,54 @@ def checkOperatingStates() {
         stateNow = opStateOne
     }
     
-    def opStateTwo = thermostatTwo.currentValue('thermostatOperatingState')
-	if ( opStateTwo != 'idle') {
+    def opStateTwo = 'idle'
+    
+    if (thermostatTwo) { opStateTwo = thermostatTwo.currentValue('thermostatOperatingState') }
+	if (opStateTwo != 'idle') {
     	activeNow = activeNow + 1
        	stateNow = opStateTwo
     }
 
 	log.trace "stateNow: $opStateOne $opStateTwo $stateNow, activeNow: $activeNow"
-    def fooState = "$stateNow $activeNow"
+    def currentStatus = "$stateNow $activeNow"
     
-	if (fooState != state.lastTime) {
-    	atomicState.lastTime = fooState
-    	if (state.ventChanged) {					// if we changed the vent last time, poll to make sure it's still set
-        	ventSwitch.poll()
+	if (currentStatus != atomicState.lastStatus) {
+    	atomicState.lastStatus = currentStatus
+    	if (atomicState.ventChanged) {					// if we changed the vent last time, poll to make sure it's still set
+        	if (pollVent) { ventSwitch.poll() }			// shouldn't need to poll if the vent's device driver reports setLevel updates correctly
             atomicState.ventChanged = false
         }
         if (tempControl) {
-        	thermometer.refresh()					// be sure we are working with the current temperature
+        	thermometer.refresh()						// be sure we are working with the current temperature
         }
          
     	log.info "${ventSwitch.device.label} is ${ventSwitch.currentLevel}%"
         
-        if (activenow == 0) {								// (re)schedule the next timed poll for 10 minutes if we just switched to both being idle
-        	runIn( 600, timeHandler, [overwrite: true] )  	// it is very unlikely that heat/cool will come on in next 5 minutes
+        if ((activeNow == 0) && pollTstats) {				// (re)schedule the next timed poll for 5 minutes if we just switched to both being idle
+        	runIn( 300, timeHandler, [overwrite: true] )  	// it is very unlikely that heat/cool will come on in next 5 minutes
         }
     	else if (activeNow == 1) {
-            if (stateNow == "cooling") {				// we always have to dump extra cold air when only 1 zone open
-    			if ( ventSwitch.currentLevel < 99 ) {
-        			log.trace "Cooling, 99% vent"
-        			ventSwitch.setLevel(99 as Integer)
+            if (stateNow == "cooling") {
+            	def coolLevel = minVent
+            	if (thermostatTwo) {						// if we're monitoring two zones (on the same system)
+                	coolLevel = 99							// we always have to dump extra cold air when only 1 zone open
+                }
+                else {
+                    if (tempControl) {						// if only 1 Tstat, we manage to the target temperature
+                    	if ( thermometer.currentTemperature > followMe.currentValue('coolingSetpoint') ) { coolLevel = 99 }
+                    }
+                }
+    			if ( ventSwitch.currentLevel != coolLevel ) {
+        			log.trace "Cooling, ${coolLevel}% vent"
+        			ventSwitch.setLevel(coolLevel as Integer)
                     atomicState.ventChanged = true
                 }
         	}
             else if (stateNow == "heating") {
-            	def heatLevel = 10
+            	def heatLevel = minVent
                 if (tempControl) {
-                	if ( thermometer.currentTemperature < followMe.currentValue('heatingSetPoint') ) { heatLevel = 99 }
+                	log.debug "temp: $thermometer.currentTemperature target: ${followMe.currentValue('heatingSetpoint')}"
+                	if ( thermometer.currentTemperature < followMe.currentValue("heatingSetpoint") ) { heatLevel = 99 }
                 }
     			if ( ventSwitch.currentLevel != heatLevel ) {
         			log.trace "Heating, ${heatLevel}% vent"
@@ -182,7 +205,8 @@ def checkOperatingStates() {
         		}  		
             }
             else if (stateNow == "fan only") {
-            	def fanLevel = 10
+            	def fanLevel = minVent
+               	if (tempControl) { fanLevel = 99 } 		// refresh the air if only managing 1 zone/room
      			if ( ventSwitch.currentLevel != fanLevel ) {
         			log.trace "Fan Only, ${fanLevel}% vent"
         			ventSwitch.setLevel(fanLevel as Integer)
@@ -194,7 +218,7 @@ def checkOperatingStates() {
 			if (stateNow == "cooling") {
             	def coolLevel = 0				// no cooling unless we're managing the temperature
                 if (tempControl) {
-                	if (thermometer.currectTemperature > followMe.currentValue("coolingSetPoint") ) { coolLevel = 99 }
+                	if (thermometer.currectTemperature > followMe.currentValue("coolingSetpoint") ) { coolLevel = 99 }
                 }
     			if ( ventSwitch.currentLevel != coolLevel ) {
         			log.trace "Dual cooling, ${coolLevel}% vent"
@@ -205,7 +229,7 @@ def checkOperatingStates() {
             else if (stateNow == "heating") {
             	def heatLevel = 0				// no heating unless we're managing the temperature
                 if (tempControl) {
-                	if ( thermometer.currentTemperature < followMe.currentValue("heatingSetPoint") ) { heatLevel = 99 }
+                	if ( thermometer.currentTemperature < followMe.currentValue("heatingSetpoint") ) { heatLevel = 99 }
                 }
     			if ( ventSwitch.currentLevel != heatLevel ) {
         			log.trace "Dual heating, ${heatLevel}% vent"
@@ -214,7 +238,7 @@ def checkOperatingStates() {
         		}  		
             }
             else if (stateNow == "fan only") {
-            	def fanLevel = 10				// no fan unless we're managing the temperature (then only a little)
+            	def fanLevel = minVent				// no fan unless we're managing the temperature (then only a little)
                 if (tempControl) { fanLevel = 30 }
      			if ( ventSwitch.currentLevel != fanLevel ) {
         			log.trace "Dual fan only, ${fanLevel}% vent"
@@ -234,11 +258,11 @@ def tempHandler(evt) {
     
     atomicState.timeHandlerLast = false
 
-// Limit polls to no more than 1 per 5 minutes
-	if (secondsPast( state.lastPoll, 300)) {
+// Limit polls to no more than 1 per 5 minutes (if required: Nest & Ecobee require, native Zwave typically don't)
+	if (pollTstats && secondsPast( state.lastPoll, 300)) {
     	log.trace "tempHandler polling"
-        pollThermostats()
-        runIn( 300, timeHandler, [overwrite: true] )	// schedule a poll in no less than 5 minutes after this one
+        pollThermostats() 
+        runIn( 300, timeHandler, [overwrite: true] )	// schedule a timed poll in no less than 5 minutes after this one
     }
 
 // if we are managing the temperature, check if we've reached the target when the temp changes in the room
@@ -264,14 +288,21 @@ def timeHandler() {
             }
         }
         
-    	pollThermostats()
-        runIn( 600, timeHandler, [overwrite: true] )  // schedule a poll in 10 minutes if things are quiet
+    	if (pollTstats) { 
+        	pollThermostats()
+        	runIn( 600, timeHandler, [overwrite: true] )  // schedule a poll in 10 minutes if things are quiet
+        }
 }
 
 def pollThermostats() {
-	thermostatOne.poll()
-    thermostatTwo.poll()
-    atomicState.lastPoll = new Date().time
+	if (pollTstats) {
+    	thermostatOne.poll()
+    	if (thermostatTwo) { thermostatTwo.poll() }	// Can be used for single-zone vent control also
+    	atomicState.lastPoll = new Date().time
+    }
+    else {
+    	atomicState.lastPoll = 0
+    }
 }
 
 //check last message so thermostat poll doesn't happen all the time
