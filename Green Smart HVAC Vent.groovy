@@ -94,12 +94,18 @@ def initialize() {
     
 // Get the latest values from all the devices we care about BEFORE we subscribe to events...this avoids a race condition at installation 
 // & reconfigure time
-
-	ventSwitch.setLevel(minVent as Integer)
+	
+    if (tempControl) {
+    	ventSwitch.setLevel( 99 as Integer)
+    }
+    else {
+    	ventSwitch.setLevel(minVent as Integer)
+    }
     if (pollVent) { ventSwitch.refresh() }	// get the current / latest status of everything
     atomicState.ventChanged = false		// just polled for the latest, don't need to poll again until we change the setting (battery saving)
 
 	thermometer.refresh()				// get the latest temperature from the room
+    
     if (pollTstats) { 
     	pollThermostats()
     	runIn( 600, timeHandler, [overwrite: true] )  // schedule another poll in 10 minutes (assume things are quiet)
@@ -203,6 +209,24 @@ def checkOperatingStates() {
 	if (opStateTwo != 'idle') {
     	activeNow = activeNow + 1
        	stateNow = opStateTwo
+    }
+    
+    if (activeNow == 2) {
+    	if (opStateOne != opStateTwo) {
+        	if (opStateTwo == 'fan only') {
+            	stateNow = opStateOne			// if one is fan only, we're probably getting heat/cool in both zones
+            }
+            else {								// uh-oh, one is heating, one is cooling
+            	if (false) {		// if (tempControl) {
+                	stateNow = followMe.currentValue('thermostatOperatingState')	// We're conflicted, let's pretend we're running the zone we are following
+                }
+                else {
+            		stateNow = "conflict"		// Though it can happen, we have no idea how to handle this
+                    activeNow = 0				// pretend we are idle until conflict is over
+//                    ventSwitch.off()			// do we shut the vent? or open it fully in case we are cooling?
+                }
+            }
+        }
     }
 
 	log.trace "stateNow: $opStateOne $opStateTwo $stateNow, activeNow: $activeNow inRecovery: $inRecovery"
