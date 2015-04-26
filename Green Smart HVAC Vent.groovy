@@ -200,12 +200,12 @@ def tHandler( evt ) {
 def checkOperatingStates() {
 
 	if (atomicState.checking) { 
-    	log.info "Already checking"
+    	log.trace "Already checking"
         if (tempControl) { runIn( 2, checkOperatingStates, [overwrite: false] ) } // don't want to ignore an atomicState or temperature change
         return
     }
     atomicState.checking = true
-    log.info "Checking"
+    log.trace "Checking"
     
     def inRecovery = atomicState.recoveryMode
     def priorStatus = atomicState.lastStatus
@@ -237,7 +237,7 @@ def checkOperatingStates() {
                  	stateNow = 'conflict' 
                     active = 0
                 }
-                log.debug "H/C Conflict!"
+                log.info "H/C Conflict!"
             }
             else {
             	// stateNow = opStateTwo  // opStateOne is fan only, so opStateTwo is the right answer
@@ -245,18 +245,19 @@ def checkOperatingStates() {
         }
     }
 
-	log.trace "stateNow: $opStateOne $opStateTwo $stateNow, activeNow: $activeNow inRecovery: $inRecovery"
+	log.info "stateNow: $opStateOne $opStateTwo $stateNow, activeNow: $activeNow inRecovery: $inRecovery"
     def currentStatus = "$stateNow $activeNow $inRecovery"
     
-	if (currentStatus != priorStatus) {
+	if (currentStatus == priorStatus) {
+    	log.trace "Nothing changed!"
+    }
+    else {
     	atomicState.lastStatus = currentStatus
-    	if (atomicState.ventChanged) {					// if we changed the vent last time, poll to make sure it's still set
+
+		if (atomicState.ventChanged) {					// if we changed the vent last time, poll to make sure it's still set
         	if (pollVent) { ventSwitch.poll() }			// shouldn't need to poll if the vent's device driver reports setLevel updates correctly
             atomicState.ventChanged = false
         }
-//        if (tempControl) {
-//        	thermometer.refresh()						// be sure we are working with the current temperature
-//        }
          
     	log.info "${ventSwitch.device.label} is ${ventSwitch.currentLevel}%"
         
@@ -281,7 +282,7 @@ def checkOperatingStates() {
                     }
                 }
     			if ( ventSwitch.currentLevel != coolLevel ) {
-        			log.trace "Cooling, ${coolLevel}% vent"
+        			log.info "Cooling, ${coolLevel}% vent"
         			ventSwitch.setLevel(coolLevel as Integer)
                     atomicState.ventChanged = true
                 }
@@ -298,7 +299,7 @@ def checkOperatingStates() {
                     }
                 }
     			if ( ventSwitch.currentLevel != heatLevel ) {
-        			log.trace "Heating, ${heatLevel}% vent"
+        			log.info "Heating, ${heatLevel}% vent"
         			ventSwitch.setLevel(heatLevel as Integer)
                     atomicState.ventChanged = true
         		}  		
@@ -307,7 +308,7 @@ def checkOperatingStates() {
             	def fanLevel = minVent
                	if (tempControl) { fanLevel = 99 } 		// refresh the air if only managing 1 zone/room
      			if ( ventSwitch.currentLevel != fanLevel ) {
-        			log.trace "Fan Only, ${fanLevel}% vent"
+        			log.info "Fan Only, ${fanLevel}% vent"
         			ventSwitch.setLevel(fanLevel as Integer)
                     atomicState.ventChanged = true
                 }
@@ -326,7 +327,7 @@ def checkOperatingStates() {
                     }
                 }
     			if ( ventSwitch.currentLevel != coolLevel ) {
-        			log.trace "Dual cooling, ${coolLevel}% vent"
+        			log.info "Dual cooling, ${coolLevel}% vent"
         			ventSwitch.setLevel(coolLevel as Integer)
                     atomicState.ventChanged = true
         		}
@@ -343,7 +344,7 @@ def checkOperatingStates() {
                     }
                 }
     			if ( ventSwitch.currentLevel != heatLevel ) {
-        			log.trace "Dual heating, ${heatLevel}% vent"
+        			log.info "Dual heating, ${heatLevel}% vent"
         			ventSwitch.setLevel(heatLevel as Integer)
                     atomicState.ventChanged = true
         		}  		
@@ -352,7 +353,7 @@ def checkOperatingStates() {
             	def fanLevel = minVent				// no fan unless we're managing the temperature (then only a little)
                 if (tempControl) { fanLevel = 33 }
      			if ( ventSwitch.currentLevel != fanLevel ) {
-        			log.trace "Dual fan only, ${fanLevel}% vent"
+        			log.info "Dual fan only, ${fanLevel}% vent"
         			ventSwitch.setLevel(fanLevel as Integer)
                     atomicState.ventChanged = true
                 }
@@ -360,7 +361,7 @@ def checkOperatingStates() {
     	}
     }
     atomicState.checking = false
-    log.info "Done!"
+    log.trace "Done!"
 }
 
 
@@ -379,30 +380,32 @@ def tempHandler(evt) {
 // if we are managing the temperature, check if we've reached the target when the temp changes in the room
     if (tempControl) { 									
     	if ((evt.device.label == thermometer.label) && (evt.name == "temperature")) {
-        	checkOperatingStates()
+            log.trace "Scheduling check"
+        	runIn( 2, checkOperatingStates, [overwrite: true] )
         }
     }
 }
 
 def timeHandler() {
-    	log.trace "timeHandler polling"
+    log.trace "timeHandler polling"
         
-        if (state.timeHandlerLast) {
-        	if (atomicState.checking) {
-        		atomicState.checking = false			// hack to ensure we do get locked out by a missed state change (happens)
-            }
-        	atomicState.timeHandlerLast = false			// essentially, if timehandler initiates the poll 2 times in a row while checking=true, reset chacking
+    if (state.timeHandlerLast) {
+	   	if (atomicState.checking) {
+        	log.debug "Checking lockout - resetting!"
+   			atomicState.checking = false			// hack to ensure we do get locked out by a missed state change (happens)
         }
-        else {
-        	if (atomicState.checking) {
-            	atomicState.timeHandlerLast = true
-            }
+        atomicState.timeHandlerLast = false			// essentially, if timehandler initiates the poll 2 times in a row while checking=true, reset chacking
+    }
+    else {
+     	if (atomicState.checking) {
+            atomicState.timeHandlerLast = true
         }
+    }
         
-    	if (pollTstats) { 
-        	pollThermostats()
-        	runIn( 600, timeHandler, [overwrite: true] )  // schedule a poll in 10 minutes if things are quiet
-        }
+    if (pollTstats) { 
+        pollThermostats()
+        runIn( 600, timeHandler, [overwrite: true] )  // schedule a poll in 10 minutes if things are quiet
+    }
 }
 
 def pollThermostats() {
