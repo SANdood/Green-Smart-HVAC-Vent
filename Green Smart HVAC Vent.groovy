@@ -88,18 +88,34 @@ def initialize() {
     atomicState.checking = false
     atomicState.ventChanged = true
     atomicState.timeHandlerLast = false
-    atomicState.highHeat = 0
-    atomicState.lowCool = 100
-    atomicState.recoveryMode = false
+
+
     
 // Get the latest values from all the devices we care about BEFORE we subscribe to events...this avoids a race condition at installation 
 // & reconfigure time
-	
+
+    atomicState.recoveryMode = false
     if (tempControl) {
-    	ventSwitch.setLevel( 99 as Integer)
+    	ventSwitch.setLevel( 99 as Integer )
+        atomicState.highHeat = followMe.currentValue( 'heatingSetpoint' ) as Integer
+        atomicState.lowCool = followMe.currentValue( 'coolingSetpoint' ) as Integer
+        
+        def checkState = followMe.currentValue( 'thermostatOperatingState' )
+        if (checkstate == 'heating') {
+        	if (followMe.currentTemperature > atomicState.highHeat) {
+            	atomicState.recoveryMode = true
+            }
+        }
+        else if (checkState == 'cooling') {
+        	if (followMe.currentTemperature < atomicState.lowCool) {
+            	atomicState.recoveryMode = true
+            }
+        }
     }
-    else {
+    else { 
     	ventSwitch.setLevel(minVent as Integer)
+		atomicState.highHeat = 0 as Integer
+   		atomicState.lowCool = 100 as Integer
     }
     if (pollVent) { ventSwitch.refresh() }	// get the current / latest status of everything
     atomicState.ventChanged = false		// just polled for the latest, don't need to poll again until we change the setting (battery saving)
@@ -124,8 +140,6 @@ def initialize() {
     if (tempControl) {
     	subscribe(followMe, "heatingSetpoint", tHandler)			// Need to know when these change (night, home, away, etc.)
         subscribe(followMe, "coolingSetpoint", tHandler)
-        atomicState.highHeat = followMe.currentValue( 'heatingSetpoint' )
-        atomicState.lowCool = followMe.currentValue( 'coolingSetpoint' )
     }
     if (trackTempChanges) {
     	subscribe(trackTempChanges, "temperature", tempHandler)		// other thermometers may send temp change events sooner than the room
@@ -141,11 +155,11 @@ def tHandler( evt ) {
 	if (tempControl) {
     	log.trace "recoveryMode: ${atomicState.recoveryMode}"
     	if (evt.device.label == followMe.label) {
-        	if (evt.name == 'thermostatOperatingMode' ) {
+        	if (evt.name == 'thermostatOperatingState' ) {
             	if (evt.value == 'idle') {
                 	if (atomicState.recoveryMode) { 
-                    	atomicState.recoveryMode == false
                         log.info "Recovery finished - idle"
+                    	atomicState.recoveryMode == false
                     }
                 }
                 else if (evt.value == 'heating') {
@@ -164,10 +178,10 @@ def tHandler( evt ) {
                 }
             }
             else if (evt.name == 'heatingSetpoint') {
-            	if (evt.value > atomicState.highHeat) { atomicState.highHeat = evt.value }
-                if (followMe.currentValue('thermostatOperatingMode') == 'heating') {
+            	if (evt.value.toInteger() > atomicState.highHeat) { atomicState.highHeat = evt.value as Integer }
+                if (followMe.currentValue('thermostatOperatingState') == 'heating') {
             		if (atomicState.recoveryMode) {
-                		if (evt.value >= thermostat.currentTemperature) {
+                		if (evt.value.toInteger() >= Math.round(thermostat.currentTemperature)) {
                     		log.info "Recovery finished - heating"
                         	atomiState.recoveryMode = false
                         }
@@ -175,10 +189,10 @@ def tHandler( evt ) {
                 }
             }
             else if (evt.name == 'coolingSetpoint') {
-            	if (evt.value < atomicState.lowCool) { atomicState.lowCool = evt.value }	
-            	if (followMe.currentValue('thermostatOperatingMode') == 'cooling') {
+            	if (evt.value.toInteger() < atomicState.lowCool) { atomicState.lowCool = evt.value as Integer }	
+            	if (followMe.currentValue('thermostatOperatingState') == 'cooling') {
             		if (atomicState.recoveryMode) {
-                		if (evt.value <= thermostat.currentTemperature) {
+                		if (evt.value.toInteger <= Math.round(thermostat.currentTemperature)) {
                     		log.info "Recovery finished - cooling"
                         	atomicState.recoveryMode = false
                         }
@@ -261,9 +275,12 @@ def checkOperatingStates() {
          
     	log.info "${ventSwitch.device.label} is ${ventSwitch.currentLevel}%"
         
-        if ((activeNow == 0) && pollTstats) {				// (re)schedule the next timed poll for 10 minutes if we just switched to both being idle
-        	runIn( 600, timeHandler, [overwrite: true] )  	// it is very unlikely that heat/cool will come on in next 10 minutes
-        }
+        if (activeNow == 0) {
+			atomicState.recoveryMode = false //belt & suspenders
+            if (pollTstats) {				// (re)schedule the next timed poll for 10 minutes if we just switched to both being idle
+        		runIn( 600, timeHandler, [overwrite: true] )  	// it is very unlikely that heat/cool will come on in next 10 minutes
+			}
+}
     	else if (activeNow == 1) {
             if (stateNow == "cooling") {
             	def coolLevel = minVent
