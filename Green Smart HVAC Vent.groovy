@@ -139,7 +139,7 @@ def tHandler( evt ) {
 	log.trace "tHandler $evt.device.label $evt.name: $evt.value"
 	
 	if (tempControl) {
-    	log.debug "$evt.device.label $followMe.label ${atomicState.RecoveryMode}"
+    	log.trace "recoveryMode: ${atomicState.recoveryMode}"
     	if (evt.device.label == followMe.label) {
         	if (evt.name == 'thermostatOperatingMode' ) {
             	if (evt.value == 'idle') {
@@ -164,36 +164,51 @@ def tHandler( evt ) {
                 }
             }
             else if (evt.name == 'heatingSetpoint') {
-            	if (atomicState.recoveryMode) {
-                	if (evt.value > thermostat.currentTemperature) {
-                    	log.info "Recovery finished - heating"
-                        atomiState.recoveryMode = false
+            	if (evt.value > atomicState.highHeat) { atomicState.highHeat = evt.value }
+                if (followMe.currentValue('thermostatOperatingMode') == 'heating') {
+            		if (atomicState.recoveryMode) {
+                		if (evt.value >= thermostat.currentTemperature) {
+                    		log.info "Recovery finished - heating"
+                        	atomiState.recoveryMode = false
+                        }
                     }
                 }
             }
             else if (evt.name == 'coolingSetpoint') {
-            	if (atomicState.recoveryMode) {
-                	if (evt.value < thermostat.currentTemperature) {
-                    	log.info "Recovery finished - cooling"
+            	if (evt.value < atomicState.lowCool) { atomicState.lowCool = evt.value }	
+            	if (followMe.currentValue('thermostatOperatingMode') == 'cooling') {
+            		if (atomicState.recoveryMode) {
+                		if (evt.value <= thermostat.currentTemperature) {
+                    		log.info "Recovery finished - cooling"
+                        	atomicState.recoveryMode = false
+                        }
                     }
                 }
             }
         }
-    }    
-	checkOperatingStates()
+    }
+
+	if (thermostatTwo) {
+        log.trace "Scheduling check"
+    	runIn( 2, checkOperatingStates, [overwrite: true] )	// Wait for all the states from both thermostats to arrive
+    }
+    else {
+    	checkOperatingStates()								// only watching the 1 tstat, no waiting required
+    }
 }
 
 def checkOperatingStates() {
 
 	if (atomicState.checking) { 
     	log.info "Already checking"
-        if (tempControl) { runIn( 10, checkOperatingStates, [overwrite: false] ) } // don't want to ignore an atomicState or temperature change
+        if (tempControl) { runIn( 2, checkOperatingStates, [overwrite: false] ) } // don't want to ignore an atomicState or temperature change
         return
     }
     atomicState.checking = true
     log.info "Checking"
     
     def inRecovery = atomicState.recoveryMode
+    def priorStatus = atomicState.lastStatus
 	def activeNow = 0
     def stateNow = 'idle'
 
@@ -203,8 +218,7 @@ def checkOperatingStates() {
         stateNow = opStateOne
     }
     
-    def opStateTwo = 'idle'
-    
+    def opStateTwo = 'idle'    
     if (thermostatTwo) { opStateTwo = thermostatTwo.currentValue('thermostatOperatingState') }
 	if (opStateTwo != 'idle') {
     	activeNow = activeNow + 1
@@ -214,17 +228,19 @@ def checkOperatingStates() {
     if (activeNow == 2) {
     	if (opStateOne != opStateTwo) {
         	if (opStateTwo == 'fan only') {
-            	stateNow = opStateOne			// if one is fan only, we're probably getting heat/cool in both zones
+            	stateNow = opStateOne			// if the second tstat is fan only, we want what the first is doing
             }
-            else {								// uh-oh, one is heating, one is cooling
-            	if (false) {		// if (tempControl) {
-                	stateNow = followMe.currentValue('thermostatOperatingState')	// We're conflicted, let's pretend we're running the zone we are following
+            else if (opStateOne != 'fan only') { // if neither are 'fan only', then we have a heating/cooling (or cooling/heading) conflict
+                stateNow = priorStatus[0..6] 	// let's just assume that the zone manager is running whatever we were doing last is still running                   
+                activeNow = 1				
+                if ((stateNow != 'heating') && (stateNow != 'cooling')) { 
+                 	stateNow = 'conflict' 
+                    active = 0
                 }
-                else {
-            		stateNow = "conflict"		// Though it can happen, we have no idea how to handle this
-                    activeNow = 0				// pretend we are idle until conflict is over
-//                    ventSwitch.off()			// do we shut the vent? or open it fully in case we are cooling?
-                }
+                log.debug "H/C Conflict!"
+            }
+            else {
+            	// stateNow = opStateTwo  // opStateOne is fan only, so opStateTwo is the right answer
             }
         }
     }
@@ -232,7 +248,7 @@ def checkOperatingStates() {
 	log.trace "stateNow: $opStateOne $opStateTwo $stateNow, activeNow: $activeNow inRecovery: $inRecovery"
     def currentStatus = "$stateNow $activeNow $inRecovery"
     
-	if (currentStatus != atomicState.lastStatus) {
+	if (currentStatus != priorStatus) {
     	atomicState.lastStatus = currentStatus
     	if (atomicState.ventChanged) {					// if we changed the vent last time, poll to make sure it's still set
         	if (pollVent) { ventSwitch.poll() }			// shouldn't need to poll if the vent's device driver reports setLevel updates correctly
@@ -244,8 +260,8 @@ def checkOperatingStates() {
          
     	log.info "${ventSwitch.device.label} is ${ventSwitch.currentLevel}%"
         
-        if ((activeNow == 0) && pollTstats) {				// (re)schedule the next timed poll for 5 minutes if we just switched to both being idle
-        	runIn( 300, timeHandler, [overwrite: true] )  	// it is very unlikely that heat/cool will come on in next 5 minutes
+        if ((activeNow == 0) && pollTstats) {				// (re)schedule the next timed poll for 10 minutes if we just switched to both being idle
+        	runIn( 600, timeHandler, [overwrite: true] )  	// it is very unlikely that heat/cool will come on in next 10 minutes
         }
     	else if (activeNow == 1) {
             if (stateNow == "cooling") {
@@ -255,6 +271,7 @@ def checkOperatingStates() {
                 }
                 else {
                     if (tempControl) {						// if only 1 Tstat, we manage to the target temperature
+                		log.info "temp: $thermometer.currentTemperature target: ${followMe.currentValue('coolingSetpoint')}"
                     	if (inRecovery) {
                         	if (thermometer.currentTemperature > atomicState.lowCool) { coolLevel = 99 }
                         }
@@ -272,7 +289,7 @@ def checkOperatingStates() {
             else if (stateNow == "heating") {
             	def heatLevel = minVent
                 if (tempControl) {
-                	log.debug "temp: $thermometer.currentTemperature target: ${followMe.currentValue('heatingSetpoint')}"
+                	log.info "temp: $thermometer.currentTemperature target: ${followMe.currentValue('heatingSetpoint')}"
                     if (inRecovery) {
                     	if (thermometer.currentTemperature < atomicState.highHeat) { heatLevel = 99 }
                     }
@@ -300,6 +317,7 @@ def checkOperatingStates() {
 			if (stateNow == "cooling") {
             	def coolLevel = minVent				// no cooling unless we're managing the temperature
                 if (tempControl) {
+                    log.info "temp: $thermometer.currentTemperature target: ${followMe.currentValue('coolingSetpoint')}"
                 	if (inRecovery) {
                        	if (thermometer.currentTemperature > atomicState.lowCool) { coolLevel = 99 }
                     }
@@ -316,6 +334,7 @@ def checkOperatingStates() {
             else if (stateNow == "heating") {
             	def heatLevel = minVent				// no heating unless we're managing the temperature
                 if (tempControl) {
+                    log.info "temp: $thermometer.currentTemperature target: ${followMe.currentValue('heatingSetpoint')}"
                     if (inRecovery) {
                     	if (thermometer.currentTemperature < atomicState.highHeat) { heatLevel = 99 }
                     }
@@ -370,7 +389,7 @@ def timeHandler() {
         
         if (state.timeHandlerLast) {
         	if (atomicState.checking) {
-        		atomicState.checking = false				// hack to ensure we do get locked out by a missed state change (happens)
+        		atomicState.checking = false			// hack to ensure we do get locked out by a missed state change (happens)
             }
         	atomicState.timeHandlerLast = false			// essentially, if timehandler initiates the poll 2 times in a row while checking=true, reset chacking
         }
