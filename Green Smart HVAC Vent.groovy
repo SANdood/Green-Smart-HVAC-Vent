@@ -43,7 +43,7 @@ def setupApp() {
 			
             paragraph ""
             input name: "thermostatOne", type: "capability.thermostat", title: "1st Thermostat", multiple: false, required: true
-			input name: "thermostatTwo", type: "capability.thermostat", title: "2nd Thermostat", multiple: false, required: false  // allow for tracking a single zone only
+			input name: "thermostatTwo", type: "capability.thermostat", title: "2nd Thermostat (optional)", multiple: false, required: false  // allow for tracking a single zone only
 			input name: "pollTstats", type: "bool", title: "Poll these thermostats? (for state changes)?", defaultValue: true, required: true
             
             input name: "trackTempChanges", type: "capability.temperatureMeasurement", title: "Monitor temp change events elsewhere also?", multiple:true, required: false
@@ -153,35 +153,44 @@ def tHandler( evt ) {
 	log.trace "tHandler $evt.device.label $evt.name: $evt.value"
 	
 	if (tempControl) {
-    	log.trace "recoveryMode: ${atomicState.recoveryMode}"
     	if (evt.device.label == followMe.label) {
+            def inRecovery = atomicState.recoveryMode
+    		log.trace "tHandler followMe: inRecovery: ${inRecovery}"
+        
         	if (evt.name == 'thermostatOperatingState' ) {
             	if (evt.value == 'idle') {
-                	if (atomicState.recoveryMode) { 
+                	if (inRecovery) { 
                         log.info "Recovery finished - idle"
                     	atomicState.recoveryMode == false
-                        thermometer.refresh()
+                    }
+                }
+                else if (evt.value == 'fan only') {
+                	if (inRecovery) {
+                    	log.info "Recovery finished - fan only"
+                        atomicState.recoveryMode = false
                     }
                 }
                 else if (evt.value == 'heating') {
-                	if (followMe.currentTemperature > followMe.currentValue('heatingSetpoint')) {
-                    	log.info "Recovery started - heating"
-                        atomicState.recoveryMode = true
-                        thermometer.refresh()
+                	if (followMe.currentTemperature > followMe.currentValue('heatingSetpoint').toInteger()) {
+                    	if (!inRecovery) {
+                        	log.info "Recovery started - heating"
+                        	atomicState.recoveryMode = true
+                        }
                     }
                 }
                 else if (evt.value == 'cooling') {
-                	if (followMe.currentTemperature < followMe.currentValue('coolingSetpoint')) {
-                    	log.info "Recovery started - cooling"
-                        atomicState.recoveryMode = true
-                        thermometer.refresh()
+                	if (followMe.currentTemperature < followMe.currentValue('coolingSetpoint').toInteger()) {
+                    	if (!inRecovery) {
+                    		log.info "Recovery started - cooling"
+                        	atomicState.recoveryMode = true
+                        }
                     }
                 }
             }
             else if (evt.name == 'heatingSetpoint') {
             	if (evt.value.toInteger() > atomicState.highHeat) { atomicState.highHeat = evt.value.toInteger() }
                 if (followMe.currentValue('thermostatOperatingState') == 'heating') {
-            		if (atomicState.recoveryMode) {
+            		if (inRecovery) {
                 		if (evt.value.toInteger() >= thermostat.currentTemperature) {
                     		log.info "Recovery finished - heating"
                         	atomicState.recoveryMode = false
@@ -192,7 +201,7 @@ def tHandler( evt ) {
             else if (evt.name == 'coolingSetpoint') {
             	if (evt.value.toInteger() < atomicState.lowCool) { atomicState.lowCool = evt.value.toInteger() }	
             	if (followMe.currentValue('thermostatOperatingState') == 'cooling') {
-            		if (atomicState.recoveryMode) {
+            		if (inRecovery) {
                 		if (evt.value.toInteger() <= thermostat.currentTemperature) {
                     		log.info "Recovery finished - cooling"
                         	atomicState.recoveryMode = false
@@ -274,7 +283,7 @@ def checkOperatingStates() {
             atomicState.ventChanged = false
         }
          
-    	log.info "${ventSwitch.device.label} is ${ventSwitch.currentLevel}%"
+    	log.info "${ventSwitch.device.label} is ${ventSwitch.currentLevel}%, ${thermometer.device.label} is ${thermometer.currentTemperature}"
         
         if (activeNow == 0) {
 			atomicState.recoveryMode = false //belt & suspenders
@@ -290,12 +299,12 @@ def checkOperatingStates() {
                 }
                 else {
                     if (tempControl) {						// if only 1 Tstat, we manage to the target temperature
-                		log.info "temp: $thermometer.currentTemperature target: ${followMe.currentValue('coolingSetpoint')}"
+                		log.info "target: ${followMe.currentValue('coolingSetpoint')}"
                     	if (inRecovery) {
                         	if (thermometer.currentTemperature > atomicState.lowCool) { coolLevel = 99 }
                         }
                         else {
-                        	if (thermometer.currentTemperature > followMe.currentValue('coolingSetpoint')) { coolLevel = 99 }
+                        	if (thermometer.currentTemperature > followMe.currentValue('coolingSetpoint').toInteger()) { coolLevel = 99 }
                         }
                     }
                 }
@@ -308,12 +317,12 @@ def checkOperatingStates() {
             else if (stateNow == "heating") {
             	def heatLevel = minVent
                 if (tempControl) {
-                	log.info "temp: $thermometer.currentTemperature target: ${followMe.currentValue('heatingSetpoint')}"
+                	log.info "target: ${followMe.currentValue('heatingSetpoint')}"
                     if (inRecovery) {
                     	if (thermometer.currentTemperature < atomicState.highHeat) { heatLevel = 99 }
                     }
                     else {
-                		if (thermometer.currentTemperature < followMe.currentValue('heatingSetpoint')) { heatLevel = 99 }
+                		if (thermometer.currentTemperature < followMe.currentValue('heatingSetpoint').toInteger()) { heatLevel = 99 }
                     }
                 }
     			if ( ventSwitch.currentLevel != heatLevel ) {
@@ -336,12 +345,12 @@ def checkOperatingStates() {
 			if (stateNow == "cooling") {
             	def coolLevel = minVent				// no cooling unless we're managing the temperature
                 if (tempControl) {
-                    log.info "temp: $thermometer.currentTemperature target: ${followMe.currentValue('coolingSetpoint')}"
+                    log.info "target: ${followMe.currentValue('coolingSetpoint')}"
                 	if (inRecovery) {
                        	if (thermometer.currentTemperature > atomicState.lowCool) { coolLevel = 99 }
                     }
                     else {
-                   		if (thermometer.currentTemperature > followMe.currentValue('coolingSetpoint')) { coolLevel = 99 }
+                   		if (thermometer.currentTemperature > followMe.currentValue('coolingSetpoint').toInteger()) { coolLevel = 99 }
                     }
                 }
     			if ( ventSwitch.currentLevel != coolLevel ) {
@@ -353,12 +362,12 @@ def checkOperatingStates() {
             else if (stateNow == "heating") {
             	def heatLevel = minVent				// no heating unless we're managing the temperature
                 if (tempControl) {
-                    log.info "temp: $thermometer.currentTemperature target: ${followMe.currentValue('heatingSetpoint')}"
+                    log.info "target: ${followMe.currentValue('heatingSetpoint')}"
                     if (inRecovery) {
                     	if (thermometer.currentTemperature < atomicState.highHeat) { heatLevel = 99 }
                     }
                     else {
-                		if (thermometer.currentTemperature < followMe.currentValue('heatingSetpoint')) { heatLevel = 99 }
+                		if (thermometer.currentTemperature < followMe.currentValue('heatingSetpoint').toInteger()) { heatLevel = 99 }
                     }
                 }
     			if ( ventSwitch.currentLevel != heatLevel ) {
