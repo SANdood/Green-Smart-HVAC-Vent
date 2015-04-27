@@ -44,14 +44,14 @@ def setupApp() {
             paragraph ""
             input name: "thermostatOne", type: "capability.thermostat", title: "1st Thermostat", multiple: false, required: true
 			input name: "thermostatTwo", type: "capability.thermostat", title: "2nd Thermostat", multiple: false, required: false  // allow for tracking a single zone only
-            input name: "pollTstats", type: "bool", title: "Poll these thermostats? (for state changes)?", defaultValue: true, required: true
+			input name: "pollTstats", type: "bool", title: "Poll these thermostats? (for state changes)?", defaultValue: true, required: true
             
-            input name: "trackTempChanges", type: "capability.temperatureMeasurement", title: "Track temp change events elsewhere?", multiple:true, required: false
+            input name: "trackTempChanges", type: "capability.temperatureMeasurement", title: "Monitor temp change events elsewhere also?", multiple:true, required: false
 		}
 
 		section("Vent control parameters:") {
         
-        	input name: "tempControl", type: "bool", title: "Actively manage room/zone temps?", defaultValue: false, required: true, refreshAfterSelection: true
+        	input name: "tempControl", type: "bool", title: "Actively manage room/zone temperature?", defaultValue: false, required: true, refreshAfterSelection: true
 			input name: "followMe", type: "capability.thermostat", title: "Follow temps on this thermostat", multiple: false, required: false, defaultValue: "${thermostatOne}"
 
 			paragraph ""
@@ -160,6 +160,7 @@ def tHandler( evt ) {
                 	if (atomicState.recoveryMode) { 
                         log.info "Recovery finished - idle"
                     	atomicState.recoveryMode == false
+                        thermometer.refresh()
                     }
                 }
                 else if (evt.value == 'heating') {
@@ -178,21 +179,21 @@ def tHandler( evt ) {
                 }
             }
             else if (evt.name == 'heatingSetpoint') {
-            	if (evt.value.toInteger() > atomicState.highHeat) { atomicState.highHeat = evt.value as Integer }
+            	if (evt.value.toInteger() > atomicState.highHeat) { atomicState.highHeat = evt.value.toInteger() }
                 if (followMe.currentValue('thermostatOperatingState') == 'heating') {
             		if (atomicState.recoveryMode) {
-                		if (evt.value.toInteger() >= Math.round(thermostat.currentTemperature)) {
+                		if (evt.value.toInteger() >= thermostat.currentTemperature) {
                     		log.info "Recovery finished - heating"
-                        	atomiState.recoveryMode = false
+                        	atomicState.recoveryMode = false
                         }
                     }
                 }
             }
             else if (evt.name == 'coolingSetpoint') {
-            	if (evt.value.toInteger() < atomicState.lowCool) { atomicState.lowCool = evt.value as Integer }	
+            	if (evt.value.toInteger() < atomicState.lowCool) { atomicState.lowCool = evt.value.toInteger() }	
             	if (followMe.currentValue('thermostatOperatingState') == 'cooling') {
             		if (atomicState.recoveryMode) {
-                		if (evt.value.toInteger <= Math.round(thermostat.currentTemperature)) {
+                		if (evt.value.toInteger() <= thermostat.currentTemperature) {
                     		log.info "Recovery finished - cooling"
                         	atomicState.recoveryMode = false
                         }
@@ -245,13 +246,13 @@ def checkOperatingStates() {
             	stateNow = opStateOne			// if the second tstat is fan only, we want what the first is doing
             }
             else if (opStateOne != 'fan only') { // if neither are 'fan only', then we have a heating/cooling (or cooling/heading) conflict
-                stateNow = priorStatus[0..6] 	// let's just assume that the zone manager is running whatever we were doing last is still running                   
+                stateNow = priorStatus[0..6] 	// let's just assume that the zone controller is still running whatever we were doing last                    
                 activeNow = 1				
                 if ((stateNow != 'heating') && (stateNow != 'cooling')) { 
                  	stateNow = 'conflict' 
                     active = 0
                 }
-                log.info "H/C Conflict!"
+                log.info "Heating/Cooling Conflict!"
             }
             else {
             	// stateNow = opStateTwo  // opStateOne is fan only, so opStateTwo is the right answer
@@ -280,7 +281,7 @@ def checkOperatingStates() {
             if (pollTstats) {				// (re)schedule the next timed poll for 10 minutes if we just switched to both being idle
         		runIn( 600, timeHandler, [overwrite: true] )  	// it is very unlikely that heat/cool will come on in next 10 minutes
 			}
-}
+		}
     	else if (activeNow == 1) {
             if (stateNow == "cooling") {
             	def coolLevel = minVent
