@@ -57,7 +57,8 @@ def setupApp() {
             paragraph ""
            	input name: "humidControl", type: 'bool', title: 'Actively manage humidity (cooling)?', defaultValue: false, /*required: true,*/ refreshAfterSelection: true
             input name: 'humidSensor', type: 'capability.relativeHumidityMeasurement', title: "Use which humidity sensor?", multiple: false, refreshAfterSelection: true, required: false
-           	input name: 'targetHumidity', type: 'number', title: 'Target humidity', defaultValue: 60, /*required: true,*/ refreshAfterSelection: true
+           	input name: 'targetHumidity', type: 'decimal', title: 'Target humidity', defaultValue: 60, /*required: true,*/ refreshAfterSelection: true
+            input name: 'maxOverCool', type: 'decimal', title: 'Max over-cool degrees', defaultValue: 2.0f, required: true
 
 			paragraph ""
     		input name: "doorWatch", type: "capability.contactSensor", title: "Monitor which door?", multiple: false, required: false, refreshAfterSelection: true
@@ -103,12 +104,28 @@ def initialize() {
 	atomicState.highHeat = 0 as Integer
 	atomicState.lowCool = 100 as Integer
     atomicState.recoveryMode = false
+    
+//    thermometer.refresh()				// get the latest temperature from the room
+
+
+    if (pollTstats) { 
+    	pollThermostats()
+    	runIn( 300, timeHandler, [overwrite: true] )  // schedule another poll in 5 minutes
+    }
+    
+    def startLevel = minVent
+    if (humidControl) {
+       	def humidity = humidSensor.currentHumidity
+        if (humidity) {
+           	if (humidity.toFloat() > targetHumidity) { 
+               	startLevel = 99 
+            }
+    	}    
+    }
+    
     if (tempControl) {
-    	followMe.poll()
-        if (humidControl) { humidSensor.refresh() }
-        ventSwitch.poll()
-    	def startLevel = minVent
-        if (humidControl && (humidSensor.currentHumidity.toFloat() < targetHumidity)) { startLevel = 99 }
+//    	followMe.poll()
+//      ventSwitch.poll()
         if (thermostatTwo) { startLevel = 99 }
         if (ventSwitch.currentLevel != startLevel) { ventSwitch.setLevel(startLevel as Integer) }
 
@@ -138,20 +155,13 @@ def initialize() {
 		atomicState.highHeat = 0 as Float
    		atomicState.lowCool = 100 as Float
     }
-    if (pollVent) { ventSwitch.refresh() }	// get the current / latest status of everything
+    if (pollVent) { ventSwitch.poll() }	// get the current / latest status of everything
     atomicState.ventChanged = false		// just polled for the latest, don't need to poll again until we change the setting (battery saving)
-
-	thermometer.refresh()				// get the latest temperature from the room
-    
-    if (pollTstats) { 
-    	pollThermostats()
-    	runIn( 600, timeHandler, [overwrite: true] )  // schedule another poll in 10 minutes (assume things are quiet)
-    }
 
 // Since we have to poll the thermostats to get them to tell us what they are doing, we need to track events that might indicate
 // one of the zones has changed from "idle", so we subscribe to events that could indicate this change. Ideally, we don't have to also
-// use scheduled polling - temp/humidity changes around the house should get us checking frequently enough - and at more usefule times
-	
+// use scheduled polling - temp/humidity changes around the house should get us checking frequently enough - and at more useful times
+
 	subscribe(thermostatOne, "thermostatOperatingState", tHandler)
 	if (thermostatTwo) { subscribe(thermostatTwo, "thermostatOperatingState", tHandler) }
     
@@ -159,7 +169,7 @@ def initialize() {
     
     if (humidControl) {
     	subscribe( humidSensor, "humidity", tempHandler)
-        humidSensor.refresh()
+//        humidSensor.refresh()
     }
     else if (thermometer.capabilities.toString().contains('Relative Humidity Measurement')) {
        	subscribe(thermometer, "humidity", tempHandler)				// if it has humidity, follow that too because it may change before temperature
@@ -202,8 +212,8 @@ def initialize() {
     	log.info "INIT: door is ${doorWatch.currentContact}"
     }
 
-// Let the event handlers do the first check
-	checkOperatingStates()				// and finally, setup the vent for our current state
+// Let the event handlers schedule the first check
+	runIn( 2, checkOperatingStates, [overwrite: true] )		// but just in case they don't
 }
 
 def tHandler( evt ) {
@@ -286,11 +296,11 @@ def checkOperatingStates() {
 
 	if (atomicState.checking) { 
     	log.trace 'Already checking'
-        if (tempControl) { runIn( 2, checkOperatingStates, [overwrite: false] ) } // don't want to ignore an atomicState or temperature change
+//        if (tempControl) { runIn( 2, checkOperatingStates, [overwrite: true] ) } // don't want to ignore an atomicState or temperature change
         return
     }
     atomicState.checking = true
-    log.trace 'Checking'
+    log.trace 'Checking started'
     
     def inRecovery = atomicState.recoveryMode
     def priorStatus = atomicState.lastStatus
@@ -383,9 +393,13 @@ def checkOperatingStates() {
                             else {
                             	if (humidControl) {
                                 	def humidity = humidSensor.currentHumidity
-                                	if (humidity > targetHumidity) {
-                                    	log.info "Overriding temperature to reduce humidity ($humidity)"
-                                    	coolLevel = 99		// Use cooling to reduce humidity
+                                    if (humidity) {									// currentHumidity inexplicably returns null sometimes
+                                		if (humidity > targetHumidity) {
+                                    		if (thermometer.currentTemperature.toFloat() > (coolSP - maxOverCool)) {	// don't over-cool!
+                                    			log.info "Overriding temperature to reduce humidity ($humidity)"
+                                    			coolLevel = 99		// Use cooling to reduce humidity
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -446,9 +460,13 @@ def checkOperatingStates() {
                 }
                 if (humidControl && (coolLevel != 99)) {
                 	def humidity = humidSensor.currentHumidity
-                    if (humidity > targetHumidity) {
-                    	log.info "Overriding temperature to reduce humidity ($humidity)"
-                        coolLevel = 33		// Use A LITTLE cooling to reduce humidity when we are in Purge mode
+                    if (humidity) {						// currentHumidity inexplicably returns null sometimes
+                    	if (humidity > targetHumidity) {
+                            if (thermometer.currentTemperature.toFloat() > (coolSP - maxOverCool)) {	// don't over-cool!
+                    			log.info "Overriding temperature to reduce humidity ($humidity)"
+                        		coolLevel = 33		// Use A LITTLE cooling to reduce humidity when we are in Purge mode
+                            }
+                        }
                     }
                 }
     			if ( ventSwitch.currentLevel != coolLevel ) {
@@ -475,7 +493,7 @@ def checkOperatingStates() {
         		}  		
             }
             else if (stateNow == 'fan only') {
-            	def fanLevel = 0				// no fan unless we're managing the temperature (then only a little)
+            	def fanLevel = minVent				// no fan unless we're managing the temperature (even then only a little)
                 if (manageTemp) { fanLevel = 33 }
      			if ( ventSwitch.currentLevel != fanLevel ) {
         			log.info "Dual fan only, ${fanLevel}% vent"
@@ -486,7 +504,7 @@ def checkOperatingStates() {
     	}
     }
     atomicState.checking = false
-    log.trace "Done!"
+    log.trace 'Checking finished'
 }
 
 
