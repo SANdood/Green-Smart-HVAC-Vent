@@ -36,7 +36,7 @@ def setupApp() {
 		section("HVAC Vent Controls") {
 			input name: "ventSwitch", type: "capability.switchLevel", title: "Vent controller?", multiple: false, required: true
             input name: "pollVent", type: "bool", title: "Poll this vent (for setLevel state)?", defaultValue: false, required: true
-            input name: "minVent", type: "decimal", title: "Minimum vent level?", defaultValue: "10", required: true
+            input name: "minVent", type: "number", title: "Minimum vent level?", defaultValue: "10", required: true
             
             paragraph ""
             input name: "thermometer", type: "capability.temperatureMeasurement", title: "Room thermometer?", multiple: false, required: true
@@ -53,6 +53,12 @@ def setupApp() {
         
         	input name: "tempControl", type: "bool", title: "Actively manage room/zone temperature?", defaultValue: false, required: true, refreshAfterSelection: true
 			input name: "followMe", type: "capability.thermostat", title: "Follow temps on this thermostat", multiple: false, required: true, refreshAfterSelection: true
+            
+            paragraph ""
+           	input name: "humidControl", type: 'bool', title: 'Actively manage humidity (cooling)?', defaultValue: false, /*required: true,*/ refreshAfterSelection: true
+            input name: 'humidSensor', type: 'capability.relativeHumidityMeasurement', title: "Use which humidity sensor?", multiple: false, refreshAfterSelection: true, required: false
+           	input name: 'targetHumidity', type: 'number', title: 'Target humidity', defaultValue: 60, /*required: true,*/ refreshAfterSelection: true
+
 			paragraph ""
     		input name: "doorWatch", type: "capability.contactSensor", title: "Monitor which door?", multiple: false, required: false, refreshAfterSelection: true
            	input name: "doorControl", type: "enum", title: "Follow temps only when door is...", options: ['Open','Closed','Both','Never'], defaultValue: 'Both', required: true, refreshAfterSelection: true
@@ -91,8 +97,6 @@ def initialize() {
     atomicState.timeHandlerLast = false
     atomicState.managingTemp = tempControl
 
-
-    
 // Get the latest values from all the devices we care about BEFORE we subscribe to events...this avoids a race condition at installation 
 // & reconfigure time
 
@@ -100,17 +104,24 @@ def initialize() {
 	atomicState.lowCool = 100 as Integer
     atomicState.recoveryMode = false
     if (tempControl) {
-    	ventSwitch.setLevel( 99 as Integer )
-        if(followMe.currentValue('programType') != 'hold') {
-        	if (followMe.currentValue('thermostatMode').contains('eat')) {
-        		atomicState.highHeat = followMe.currentValue('heatingSetpoint').toFloat()
+    	followMe.poll()
+        if (humidControl) { humidSensor.refresh() }
+        ventSwitch.poll()
+    	def startLevel = minVent
+        if (humidControl && (humidSensor.currentHumidity.toFloat() < targetHumidity)) { startLevel = 99 }
+        if (thermostatTwo) { startLevel = 99 }
+        if (ventSwitch.currentLevel != startLevel) { ventSwitch.setLevel(startLevel as Integer) }
+
+        if(followMe.currentProgramType != 'hold') {
+        	if (followMe.currentThermostatMode.contains('eat')) {
+        		atomicState.highHeat = followMe.currentHeatingSetpoint.toFloat()
             }
-            else if (followMe.currentValue('thermostatMode').contains('cool')) {
-        		atomicState.lowCool = followMe.currentValue('coolingSetpoint').toFloat()
+            else if (followMe.currentThermostatMode.contains('cool')) {
+        		atomicState.lowCool = followMe.currentCoolingSetpoint.toFloat()
             }
         }
         
-        def checkState = followMe.currentValue( 'thermostatOperatingState' )
+        def checkState = followMe.currentThermostatOperatingState
         if (checkstate == 'heating') {
         	if ((atomicState.highHeat > 0) && (followMe.currentTemperature > atomicState.highHeat)) {
             	atomicState.recoveryMode = true
@@ -145,7 +156,12 @@ def initialize() {
 	if (thermostatTwo) { subscribe(thermostatTwo, "thermostatOperatingState", tHandler) }
     
     subscribe(thermometer, "temperature", tempHandler)
-    if (thermometer.capabilities.toString().contains('Relative Humidity Measurement')) {
+    
+    if (humidControl) {
+    	subscribe( humidSensor, "humidity", tempHandler)
+        humidSensor.refresh()
+    }
+    else if (thermometer.capabilities.toString().contains('Relative Humidity Measurement')) {
        	subscribe(thermometer, "humidity", tempHandler)				// if it has humidity, follow that too because it may change before temperature
     }
     
@@ -169,6 +185,22 @@ def initialize() {
         	subscribe(doorWatch, "contact", doorHandler)
         }
     }
+    
+    String init = "INIT: temp is ${thermometer.currentTemperature}°"
+    if (tempControl) {
+    	init = init + ", target is ${followMe.currentHeatingSetpoint}°(H), ${followMe.currentCoolingSetpoint}°(C)"
+    }
+    log.info init
+    
+    if (humidControl) {
+    	log.info "INIT: humidity is ${humidSensor.currentHumidity}%, target is ${targetHumidity}%"
+    }
+    
+    log.info "INIT: vent is ${ventSwitch.currentLevel}% open"
+    
+    if (doorWatch) {
+    	log.info "INIT: door is ${doorWatch.currentContact}"
+    }
 
 // Let the event handlers do the first check
 	checkOperatingStates()				// and finally, setup the vent for our current state
@@ -185,58 +217,60 @@ def tHandler( evt ) {
         	if (evt.name == 'thermostatOperatingState' ) {
             	if (evt.value == 'idle') {
                 	if (inRecovery) { 
-                        log.info "Recovery finished - idle"
+                        log.info 'Recovery finished - idle'
                     	atomicState.recoveryMode == false
                     }
                 }
                 else if (evt.value == 'fan only') {
                 	if (inRecovery) {
-                    	log.info "Recovery finished - fan only"
+                    	log.info 'Recovery finished - fan only'
                         atomicState.recoveryMode = false
                     }
                 }
                 else if (evt.value == 'heating') {
-                	if (followMe.currentTemperature > followMe.currentValue('heatingSetpoint').toFloat()) {
+                	if (followMe.currentTemperature > followMe.currentHeatingSetpoint.toFloat()) {
                     	if (!inRecovery) {
-                        	log.info "Recovery started - heating"
+                        	log.info 'Recovery started - heating'
                         	atomicState.recoveryMode = true
                         }
                     }
                 }
                 else if (evt.value == 'cooling') {
-                	if (followMe.currentTemperature < followMe.currentValue('coolingSetpoint').toFloat()) {
+                	if (followMe.currentTemperature < followMe.currentCoolingSetpoint.toFloat()) {
                     	if (!inRecovery) {
-                    		log.info "Recovery started - cooling"
+                    		log.info 'Recovery started - cooling'
                         	atomicState.recoveryMode = true
                         }
                     }
                 }
             }
             else if (evt.name == 'heatingSetpoint') {
-            	if (followMe.currentValue('programType') != 'hold') {					// Some thermostats report manual hold temps as both heat&cool (e.g., EcoBee)
-                	if (followMe.currentValue('thermostatMode').contains('eat')) {		// Some return 'emergencyHeat', so we just look for 'eat' instead of 'heat'		
-            			if (evt.float > atomicState.highHeat) { atomicState.highHeat = evt.float }
+            	atomicState.lastStatus = 'heatingSetpoint changed'				// force a re-check of vent when target changes
+            	if (followMe.currentProgramType != 'hold') {					// Some thermostats report manual hold temps as both heat&cool (e.g., EcoBee)
+                	if (followMe.currentThermostatMode.contains('eat')) {		// Some return 'emergencyHeat', so we just look for 'eat' instead of 'heat'		
+            			if (evt.value.toFloat() > atomicState.highHeat) { atomicState.highHeat = evt.value.toFloat() }
                     }
                 }
-                if (followMe.currentValue('thermostatOperatingState') == 'heating') {
+                if (followMe.currentThermostatOperatingState == 'heating') {
             		if (inRecovery) {
-                		if (evt.float >= followMe.currentTemperature) {
-                    		log.info "Recovery finished - heating"
+                		if (evt.value.toFloat() >= followMe.currentTemperature) {
+                    		log.info 'Recovery finished - heating'
                         	atomicState.recoveryMode = false
                         }
                     }
                 }
             }
             else if (evt.name == 'coolingSetpoint') {
-            	if (followMe.currentValue('programType') != 'hold') {
-                	if (followMe.currentValue('thermostatMode').contains('cool')) {
-            			if (evt.float < atomicState.lowCool) { atomicState.lowCool = evt.float }
+            	atomicState.lastStatus = 'coolingSetpoint changed'				// force recheck
+            	if (followMe.currentProgramType != 'hold') {
+                	if (followMe.currentThermostatMode.contains('cool')) {
+            			if (evt.value.toFloat() < atomicState.lowCool) { atomicState.lowCool = evt.value.toFloat() }
                     }
                 }
-            	if (followMe.currentValue('thermostatOperatingState') == 'cooling') {
+            	if (followMe.currentThermostatOperatingState == 'cooling') {
             		if (inRecovery) {
-                		if (evt.float <= followMe.currentTemperature) {
-                    		log.info "Recovery finished - cooling"
+                		if (evt.value.toFloat() <= followMe.currentTemperature) {
+                    		log.info 'Recovery finished - cooling'
                         	atomicState.recoveryMode = false
                         }
                     }
@@ -244,25 +278,19 @@ def tHandler( evt ) {
             }
         }
     }
-
-	if (thermostatTwo) {
-        log.trace "Scheduling check"
-    	runIn( 2, checkOperatingStates, [overwrite: true] )	// Wait for all the states from both thermostats to arrive
-    }
-    else {
-    	checkOperatingStates()								// only watching the 1 tstat, no waiting required
-    }
+    log.trace 'Scheduling check'
+ 	runIn( 2, checkOperatingStates, [overwrite: true] )	// Wait for all the states from thermostat(s) to arrive (e.g. heating/coolingSetpoint arrive separately)
 }
 
 def checkOperatingStates() {
 
 	if (atomicState.checking) { 
-    	log.trace "Already checking"
+    	log.trace 'Already checking'
         if (tempControl) { runIn( 2, checkOperatingStates, [overwrite: false] ) } // don't want to ignore an atomicState or temperature change
         return
     }
     atomicState.checking = true
-    log.trace "Checking"
+    log.trace 'Checking'
     
     def inRecovery = atomicState.recoveryMode
     def priorStatus = atomicState.lastStatus
@@ -270,14 +298,14 @@ def checkOperatingStates() {
 	def activeNow = 0
     def stateNow = 'idle'
 
-    def opStateOne = thermostatOne.currentValue('thermostatOperatingState')
+    def opStateOne = thermostatOne.currentThermostatOperatingState
 	if (opStateOne != 'idle') {
     	activeNow = activeNow + 1
         stateNow = opStateOne
     }
     
     def opStateTwo = 'idle'    
-    if (thermostatTwo) { opStateTwo = thermostatTwo.currentValue('thermostatOperatingState') }
+    if (thermostatTwo) { opStateTwo = thermostatTwo.currentThermostatOperatingState }
 	if (opStateTwo != 'idle') {
     	activeNow = activeNow + 1
        	stateNow = opStateTwo
@@ -287,13 +315,14 @@ def checkOperatingStates() {
     	if (opStateOne != opStateTwo) {
         	if (opStateTwo == 'fan only') {
             	stateNow = opStateOne			// if the second tstat is fan only, we want what the first is doing
+                activeNow = 1
             }
             else if (opStateOne != 'fan only') { // if neither are 'fan only', then we have a heating/cooling (or cooling/heading) conflict
                 stateNow = priorStatus[0..6] 	// let's just assume that the zone controller is still running whatever we were doing last                    
                 activeNow = 1				
                 if ((stateNow != 'heating') && (stateNow != 'cooling')) { 
                  	stateNow = 'cooling'		// default to the "safe" answer
-                    active = 1
+                    activeNow = 1
                 }
                 log.info "Heating/Cooling Conflict - assumed ${stateNow}!"
             }
@@ -303,11 +332,11 @@ def checkOperatingStates() {
         }
     }
 
-	log.info "stateNow: $opStateOne $opStateTwo $stateNow, activeNow: $activeNow inRecovery: $inRecovery"
-    def currentStatus = "$stateNow $activeNow $inRecovery"
+	log.info "stateNow: $opStateOne $opStateTwo $stateNow, activeNow: $activeNow inRecovery: $inRecovery manageTemp: $manageTemp"
+    def currentStatus = "$stateNow $activeNow $inRecovery $manageTemp"
     
 	if (currentStatus == priorStatus) {
-    	log.trace "Nothing changed!"
+    	log.trace 'Nothing changed!'
     }
     else {
     	atomicState.lastStatus = currentStatus
@@ -317,23 +346,30 @@ def checkOperatingStates() {
             atomicState.ventChanged = false
         }
          
-    	log.info "${ventSwitch.displayName} is ${ventSwitch.currentLevel}%, ${thermometer.displayName} is ${thermometer.currentTemperature}°"
+    	log.info "${ventSwitch.displayName} is ${ventSwitch.currentLevel}%, ${thermometer.displayName} temperature is ${thermometer.currentTemperature}°"
         
         if (activeNow == 0) {
 			atomicState.recoveryMode = false //belt & suspenders
+            if (thermostatTwo) {			// always default to full open if we are acting as purge vent
+                if (ventSwitch.currentLevel != 99) {
+                	ventSwitch.setLevel( 99 )
+                    atomicState.ventChanged = true
+                }
+            }
             if (pollTstats) {				// (re)schedule the next timed poll for 10 minutes if we just switched to both being idle
         		runIn( 600, timeHandler, [overwrite: true] )  	// it is very unlikely that heat/cool will come on in next 10 minutes
 			}
 		}
     	else if (activeNow == 1) {
-            if (stateNow == "cooling") {
-            	def coolLevel = minVent
+            if (stateNow == 'cooling') {
+            	def coolLevel = 0
             	if (thermostatTwo) {						// if we're monitoring two zones (on the same system)
                 	coolLevel = 99							// we always have to dump extra cold air when only 1 zone open
                 }
                 else {
-                    if (manageTemp) {						// if only 1 Tstat, we manage to the target temperature
-                		Float coolSP = followMe.currentValue('coolingSetpoint').toFloat()
+                    if (manageTemp || humidControl) {						// if only 1 Tstat, we manage to the target temperature & humidity
+                    	coolLevel = minVent
+                		Float coolSP = followMe.currentCoolingSetpoint.toFloat()
                         log.info "target: ${coolSP}°"
                         if (coolSP < atomicState.lowCool) { atomicState.lowCool = coolSP }	// another belt & suspenders (in case we are in Auto mode)
                         
@@ -341,7 +377,18 @@ def checkOperatingStates() {
                         	if (thermometer.currentTemperature.toFloat() > atomicState.lowCool) { coolLevel = 99 }
                         }
                         else {
-                        	if (thermometer.currentTemperature.toFloat() > coolSP) { coolLevel = 99 }
+                        	if (thermometer.currentTemperature.toFloat() > coolSP) {
+                            	coolLevel = 99 
+                            }
+                            else {
+                            	if (humidControl) {
+                                	def humidity = humidSensor.currentHumidity
+                                	if (humidity > targetHumidity) {
+                                    	log.info "Overriding temperature to reduce humidity ($humidity)"
+                                    	coolLevel = 99		// Use cooling to reduce humidity
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -351,10 +398,11 @@ def checkOperatingStates() {
                     atomicState.ventChanged = true
                 }
         	}
-            else if (stateNow == "heating") {
-            	def heatLevel = minVent
+            else if (stateNow == 'heating') {
+            	def heatLevel = 0
                 if (manageTemp) {
-                	Float heatSP = followMe.currentValue('heatingSetpoint').toFloat()
+                	heatLevel = minVent
+                	Float heatSP = followMe.currentHeatingSetpoint.toFloat()
                     Float hiHeat = atomicState.highHeat
                 	log.info "target: ${heatSP}°, ${hiHeat}°"
                     if (heatSP > hiHeat) { hiHeat = heatSP }
@@ -367,14 +415,15 @@ def checkOperatingStates() {
                     }
                     if (atomicState.highHeat != hiHeat) { atomicState.highHeat = hiHeat }
                 }
-    			if ( ventSwitch.currentLevel != heatLevel ) {
+    			if (ventSwitch.currentLevel != heatLevel) {
         			log.info "Heating, ${heatLevel}% vent"
         			ventSwitch.setLevel(heatLevel as Integer)
                     atomicState.ventChanged = true
         		}  		
             }
-            else if (stateNow == "fan only") {
+            else if (stateNow == 'fan only') {
             	def fanLevel = minVent
+                if (thermostatTwo) { fanLevel = 33 }
                	if (manageTemp) { fanLevel = 99 } 		// refresh the air if only managing 1 zone/room
      			if ( ventSwitch.currentLevel != fanLevel ) {
         			log.info "Fan Only, ${fanLevel}% vent"
@@ -384,15 +433,22 @@ def checkOperatingStates() {
             }
         }
     	else if (activeNow == 2) {
-			if (stateNow == "cooling") {
+			if (stateNow == 'cooling') {
             	def coolLevel = minVent				// no cooling unless we're managing the temperature
                 if (manageTemp) {
-                    log.info "target: ${followMe.currentValue('coolingSetpoint').toFloat()}°"
+                    log.info "target: ${followMe.currentCoolingSetpoint.toFloat()}°"
                 	if (inRecovery) {
                        	if (thermometer.currentTemperature.toFloat() > atomicState.lowCool) { coolLevel = 99 }
                     }
                     else {
-                   		if (thermometer.currentTemperature.toFloat() > followMe.currentValue('coolingSetpoint').toFloat()) { coolLevel = 99 }
+                   		if (thermometer.currentTemperature.toFloat() > followMe.currentCoolingSetpoint.toFloat()) { coolLevel = 99 }
+                    }
+                }
+                if (humidControl && (coolLevel != 99)) {
+                	def humidity = humidSensor.currentHumidity
+                    if (humidity > targetHumidity) {
+                    	log.info "Overriding temperature to reduce humidity ($humidity)"
+                        coolLevel = 33		// Use A LITTLE cooling to reduce humidity when we are in Purge mode
                     }
                 }
     			if ( ventSwitch.currentLevel != coolLevel ) {
@@ -401,15 +457,15 @@ def checkOperatingStates() {
                     atomicState.ventChanged = true
         		}
             }
-            else if (stateNow == "heating") {
+            else if (stateNow == 'heating') {
             	def heatLevel = minVent				// no heating unless we're managing the temperature
                 if (manageTemp) {
-                    log.info "target: ${followMe.currentValue('heatingSetpoint').toFloat()}°"
+                    log.info "target: ${followMe.currentHeatingSetpoint.toFloat()}°"
                     if (inRecovery) {
                     	if (thermometer.currentTemperature.toFloat() < atomicState.highHeat) { heatLevel = 99 }
                     }
                     else {
-                		if (thermometer.currentTemperature.toFloat() < followMe.currentValue('heatingSetpoint').toFloat()) { heatLevel = 99 }
+                		if (thermometer.currentTemperature.toFloat() < followMe.currentHeatingSetpoint.toFloat()) { heatLevel = 99 }
                     }
                 }
     			if ( ventSwitch.currentLevel != heatLevel ) {
@@ -418,8 +474,8 @@ def checkOperatingStates() {
                     atomicState.ventChanged = true
         		}  		
             }
-            else if (stateNow == "fan only") {
-            	def fanLevel = minVent				// no fan unless we're managing the temperature (then only a little)
+            else if (stateNow == 'fan only') {
+            	def fanLevel = 0				// no fan unless we're managing the temperature (then only a little)
                 if (manageTemp) { fanLevel = 33 }
      			if ( ventSwitch.currentLevel != fanLevel ) {
         			log.info "Dual fan only, ${fanLevel}% vent"
@@ -441,27 +497,34 @@ def tempHandler(evt) {
 
 // Limit polls to no more than 1 per 5 minutes (if required: Nest & Ecobee require, native Zwave typically don't)
 	if (pollTstats && secondsPast( state.lastPoll, 300)) {
-    	log.trace "tempHandler polling"
+    	log.trace 'tempHandler polling'
         pollThermostats() 
         runIn( 300, timeHandler, [overwrite: true] )	// schedule a timed poll in no less than 5 minutes after this one
     }
 
-// if we are managing the temperature, check if we've reached the target when the temp changes in the room
+// if we are managing the temperature or humidity, check if we've reached the target when the temp changes in the room
     if (atomicState.managingTemp) { 									
-    	if ((evt.displayName == thermometer.displayName) && (evt.name == "temperature")) {
-        	atomicState.lastStatus = "foo"		// force a vent adjustment, if necessary
-            log.trace "Scheduling check"
+    	if ((evt.displayName == thermometer.displayName) && (evt.name == 'temperature')) {
+        	atomicState.lastStatus = 'temperature changed'		// force a vent adjustment, if necessary
+            log.trace 'Scheduling check (temp)'
         	runIn( 2, checkOperatingStates, [overwrite: true] )
+        }
+    }
+    else if (humidControl) {
+    	if ((evt.displayName == humidSensor.displayName) && (evt.name == 'humidity')) {
+            atomicState.lastStatus = 'humidity changed'
+            log.trace 'Scheduling check (humid)'
+            runIn( 2, checkOperatingStates, [overwrite: true] )
         }
     }
 }
 
 def timeHandler() {
-    log.trace "timeHandler polling"
+    log.trace 'timeHandler polling'
         
     if (state.timeHandlerLast) {
 	   	if (atomicState.checking) {
-        	log.debug "Checking lockout - resetting!"
+        	log.debug 'Checking lockout - resetting!'
    			atomicState.checking = false			// hack to ensure we do get locked out by a missed state change (happens)
         }
         atomicState.timeHandlerLast = false			// essentially, if timehandler initiates the poll 2 times in a row while checking=true, reset chacking
