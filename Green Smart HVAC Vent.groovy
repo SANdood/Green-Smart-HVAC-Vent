@@ -83,9 +83,10 @@ def updated() {
 	log.debug "Updated with settings: ${settings}"
 
 	unsubscribe()
-	unschedule(tempHandler)
-    unschedule(timeHandler)
-    unschedule(checkOperatingStates)
+//    unschedule(tempHandler)
+//    unschedule(timeHandler)
+//    unschedule(checkOperatingStates)
+	unschedule()
 	initialize()
 }
 
@@ -96,6 +97,7 @@ def initialize() {
     atomicState.checking = false
     atomicState.ventChanged = true
     atomicState.timeHandlerLast = false
+    atomicState.lastPoll = 0
     atomicState.managingTemp = tempControl
 
 // Get the latest values from all the devices we care about BEFORE we subscribe to events...this avoids a race condition at installation 
@@ -213,7 +215,11 @@ def initialize() {
     }
 
 // Let the event handlers schedule the first check
-	runIn( 2, checkOperatingStates, [overwrite: true] )		// but just in case they don't
+	runIn( 2, checkOperatingStates, [overwrite: false] )		// but just in case they don't
+    runIn( 247, timeHandler, [overwrite: true] )				// kick off the thermostat(s) polling cycle
+//    checkOperatingStates()
+    
+    log.debug "Initialization finished."
 }
 
 def tHandler( evt ) {
@@ -367,7 +373,7 @@ def checkOperatingStates() {
                 }
             }
             if (pollTstats) {				// (re)schedule the next timed poll for 10 minutes if we just switched to both being idle
-        		runIn( 600, timeHandler, [overwrite: true] )  	// it is very unlikely that heat/cool will come on in next 10 minutes
+        		runIn( 483, timeHandler, [overwrite: true] )  	// it is very unlikely that heat/cool will come on in next 10 minutes
 			}
 		}
     	else if (activeNow == 1) {
@@ -511,16 +517,18 @@ def checkOperatingStates() {
 def tempHandler(evt) {
 	log.trace "tempHandler $evt.displayName $evt.name: $evt.value"
     
+    Integer pollFreq = 227		// Minimum poll is 3 minutes - we add a little to accomodate network delays
+    
     atomicState.timeHandlerLast = false
 
-// Limit polls to no more than 1 per 5 minutes (if required: Nest & Ecobee require, native Zwave typically don't)
-	if (pollTstats && secondsPast( state.lastPoll, 300)) {
+// Limit polls to no more than 1 per $pollFreq (3) minutes (if required: Nest & Ecobee require, native Zwave typically don't)
+	if (pollTstats && secondsPast( state.lastPoll, pollFreq)) {
     	log.trace 'tempHandler polling'
         pollThermostats() 
-        runIn( 300, timeHandler, [overwrite: true] )	// schedule a timed poll in no less than 5 minutes after this one
+        runIn( pollFreq, timeHandler, [overwrite: true] )	// schedule a timed poll in no less than 5 minutes after this one
     }
 
-// if we are managing the temperature or humidity, check if we've reached the target when the temp changes in the room
+// if we are managing the temperature or humidity, check if we've reached the target when either changes
     if (atomicState.managingTemp) { 									
     	if ((evt.displayName == thermometer.displayName) && (evt.name == 'temperature')) {
         	atomicState.lastStatus = 'temperature changed'		// force a vent adjustment, if necessary
@@ -540,7 +548,7 @@ def tempHandler(evt) {
 def timeHandler() {
     log.trace 'timeHandler polling'
         
-    if (state.timeHandlerLast) {
+    if (atomicState.timeHandlerLast) {
 	   	if (atomicState.checking) {
         	log.debug 'Checking lockout - resetting!'
    			atomicState.checking = false			// hack to ensure we do get locked out by a missed state change (happens)
@@ -555,7 +563,20 @@ def timeHandler() {
         
     if (pollTstats) { 
         pollThermostats()
-        runIn( 600, timeHandler, [overwrite: true] )  // schedule a poll in 10 minutes if things are quiet
+        
+        Integer delayPoll = 253					// Minimum poll time is 3 minutes
+        	
+        if (thermostatOne.currentThermostatOperatingState == 'idle') {
+        	if (thermostatTwo) {
+            	if (thermostatTwo.currentThermostatOperatingState == 'idle') {
+                	delayPoll = delayPoll * 2					// both are idle - long wait (unless something changes)
+                }
+            }
+            else {
+            	delayPoll = delayPoll * 2					// no thermostatTwo and thermostatOne is idle - long wait
+            }
+        }                
+        runIn( delayPoll, timeHandler, [overwrite: true] )  // schedule the next poll
     }
 }
 
