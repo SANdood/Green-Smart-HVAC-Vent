@@ -107,12 +107,9 @@ def initialize() {
 	atomicState.lowCool = 100 as Integer
     atomicState.recoveryMode = false
     
-//    thermometer.refresh()				// get the latest temperature from the room
-
-
     if (pollTstats) { 
     	pollThermostats()
-    	runIn( 300, timeHandler, [overwrite: true] )  // schedule another poll in 5 minutes
+    	runIn( 183, timeHandler, [overwrite: true] )  // schedule another poll in 3 minutes
     }
     
     def startLevel = minVent
@@ -126,8 +123,6 @@ def initialize() {
     }
     
     if (tempControl) {
-//    	followMe.poll()
-//      ventSwitch.poll()
         if (thermostatTwo) { startLevel = 99 }
         if (ventSwitch.currentLevel != startLevel) { ventSwitch.setLevel(startLevel as Integer) }
 
@@ -216,8 +211,6 @@ def initialize() {
 
 // Let the event handlers schedule the first check
 	runIn( 2, checkOperatingStates, [overwrite: false] )		// but just in case they don't
-    runIn( 247, timeHandler, [overwrite: true] )				// kick off the thermostat(s) polling cycle
-//    checkOperatingStates()
     
     log.debug "Initialization finished."
 }
@@ -372,8 +365,8 @@ def checkOperatingStates() {
                     atomicState.ventChanged = true
                 }
             }
-            if (pollTstats) {				// (re)schedule the next timed poll for 10 minutes if we just switched to both being idle
-        		runIn( 483, timeHandler, [overwrite: true] )  	// it is very unlikely that heat/cool will come on in next 10 minutes
+            if (pollTstats) {				// (re)schedule the next timed poll for 6 minutes if we just switched to both being idle
+        		runIn( 360, timeHandler, [overwrite: true] )  	// it is very unlikely that heat/cool will come on in next 6 minutes
 			}
 		}
     	else if (activeNow == 1) {
@@ -517,7 +510,7 @@ def checkOperatingStates() {
 def tempHandler(evt) {
 	log.trace "tempHandler $evt.displayName $evt.name: $evt.value"
     
-    Integer pollFreq = 227		// Minimum poll is 3 minutes - we add a little to accomodate network delays
+    Integer pollFreq = 181		// Minimum poll is 3 minutes - we add a little to accomodate network delays
     
     atomicState.timeHandlerLast = false
 
@@ -564,7 +557,7 @@ def timeHandler() {
     if (pollTstats) { 
         pollThermostats()
         
-        Integer delayPoll = 253					// Minimum poll time is 3 minutes
+        Integer delayPoll = 181					// Minimum poll time is 3 minutes
         	
         if (thermostatOne.currentThermostatOperatingState == 'idle') {
         	if (thermostatTwo) {
