@@ -45,6 +45,7 @@ def setupApp() {
             input name: "thermostatOne", type: "capability.thermostat", title: "1st Thermostat", multiple: false, required: true, refreshAfterSelection: true
 			input name: "thermostatTwo", type: "capability.thermostat", title: "2nd Thermostat (optional)", multiple: false, required: false  // allow for tracking a single zone only
 			input name: "pollTstats", type: "bool", title: "Poll these thermostats? (for state changes)?", defaultValue: true, required: true
+            input name: "pollSwitch", type: "capability.relaySwitch", title: "Poll only while switch is on?", required: false
             
             input name: "trackTempChanges", type: "capability.temperatureMeasurement", title: "Monitor temp change events elsewhere also?", multiple:true, required: false
 		}
@@ -106,10 +107,15 @@ def initialize() {
 	atomicState.highHeat = 0 as Integer
 	atomicState.lowCool = 100 as Integer
     atomicState.recoveryMode = false
+    state.fastPollSecs = 45
+    state.slowPollSecs = 90
+    state.minPollSecs = 15			// Should be what the ecobee device is using
     
-    if (pollTstats) { 
+    if (pollTstats) {
     	pollThermostats()
-    	runIn( 183, timeHandler, [overwrite: true] )  // schedule another poll in 3 minutes
+        if (!pollSwitch || (pollSwitch && (pollSwitch.currentSwitch == 'on'))) {
+    		runIn( state.fastPollSecs.toInteger(), timeHandler, [overwrite: true] )  // schedule another poll in 4 minutes
+        }
     }
     
     def startLevel = minVent
@@ -164,6 +170,11 @@ def initialize() {
     
     subscribe(thermometer, "temperature", tempHandler)
     
+    if (pollSwitch && pollTstats) {
+    	subscribe( pollSwitch, "switch", switchHandler)
+//        subscribe( pollSwitch, "switch.off", offHandler)
+    }
+    
     if (humidControl) {
     	subscribe( humidSensor, "humidity", tempHandler)
 //        humidSensor.refresh()
@@ -213,6 +224,43 @@ def initialize() {
 	runIn( 2, checkOperatingStates, [overwrite: false] )		// but just in case they don't
     
     log.debug "Initialization finished."
+}
+
+// Fan just went on or off - schedule a time check ASAP
+def switchHandler( evt ) {
+	log.trace "switchHandler $evt.displayName $evt.name: $evt.value"
+    
+    atomicState.timeHandlerLast = true
+ 
+//	def timestamp = state.lastPoll
+//	if (!(timestamp instanceof Number)) {
+//		if (timestamp instanceof Date) {
+//			timestamp = timestamp.time
+//		} else if ((timestamp instanceof String) && timestamp.isNumber()) {
+//			timestamp = timestamp.toLong()
+//		} else {
+//			timestamp = 0
+//		}
+//	}
+//	def milliSeconds = new Date().time - timestamp
+//   
+//    Integer seconds = 0			// Allow time for the tstat to update Ecobee's servers (need more time for off() than on(), it seems)
+//    												
+//    if (milliSeconds < 180000) {									// 3 minutes, in milliSeconds
+//    	seconds = (185-(milliSeconds / 1000)) as Integer	// how many more seconds do we have to wait before we can poll()?
+//    }
+// 	log.info "msecs: ${milliSeconds}, seconds: ${seconds}"
+//    
+
+	Integer seconds = state.minPollSecs
+	if (seconds != 0) {
+    	log.trace "Scheduling timeHander"
+    	runIn( seconds, timeHandler, [overwrite: true] )				// catch the last state after thermostat stops
+    }
+   	else {
+    	log.trace "calling timeHander"
+    	timeHandler()
+    }
 }
 
 def tHandler( evt ) {
@@ -359,17 +407,34 @@ def checkOperatingStates() {
         
         if (activeNow == 0) {
 			atomicState.recoveryMode = false //belt & suspenders
-            if (thermostatTwo) {			// always default to full open if we are acting as purge vent
-                if (ventSwitch.currentLevel != 99) {
-                	ventSwitch.setLevel( 99 )
-                    atomicState.ventChanged = true
+            
+            if (thermostatTwo) {			// default to full open if we are acting as purge vent
+            	if (!pollTstats || (pollStats && !pollSwitch)) { // but only if we're not using a pollSwitch (which allows us near-instant recognition of fan-on)
+                	if (ventSwitch.currentLevel != 99) {
+                		ventSwitch.setLevel( 99 )
+                    	atomicState.ventChanged = true
+                    }
                 }
             }
+            Integer seconds = state.slowPollSecs
             if (pollTstats) {				// (re)schedule the next timed poll for 6 minutes if we just switched to both being idle
-        		runIn( 360, timeHandler, [overwrite: true] )  	// it is very unlikely that heat/cool will come on in next 6 minutes
+            	if (pollSwitch) {
+                	if (pollSwitch.currentSwitch != 'off') { 
+                    	pollSwitch.off()
+                    }
+                    seconds = state.slowPollSecs 			// defaul 10 minute polling if we have a pollSwitch to wake us up
+                }
+        		runIn( seconds, timeHandler, [overwrite: true] )  	// it is very unlikely that heat/cool will come on in next 8 minutes
 			}
 		}
     	else if (activeNow == 1) {
+      		if (pollTstats) {
+            	if (pollSwitch) {
+                	if (pollSwitch.currentSwitch != 'on') { 
+                    	pollSwitch.on()
+                    }
+                }
+            }
             if (stateNow == 'cooling') {
             	def coolLevel = 0
             	if (thermostatTwo) {						// if we're monitoring two zones (on the same system)
@@ -436,8 +501,20 @@ def checkOperatingStates() {
             }
             else if (stateNow == 'fan only') {
             	def fanLevel = minVent
-                if (thermostatTwo) { fanLevel = 33 }
-               	if (manageTemp) { fanLevel = 99 } 		// refresh the air if only managing 1 zone/room
+                if (thermostatTwo) { fanLevel = 99 }
+               	if (manageTemp) {
+                	def priorState = priorStatus[0..6]
+                	if (priorState == 'cooling') {
+                    	if (thermometer.currentTemperature.toFloat() > followMe.currentCoolingSetpoint.toFloat()) { 
+                        	fanLevel = 99 			 // refresh the air if only managing 1 zone/room and we aren't already cold enough!
+                    	}
+                    }
+                    else if (priorState == 'heating') {
+                       	if (thermometer.currentTemperature.toFloat() < followMe.currentHeatingSetpoint.toFloat()) { 
+                        	fanLevel = 99 			 // refresh the air if only managing 1 zone/room and we aren't already warm enough! 
+                        }
+                    }
+                }
      			if ( ventSwitch.currentLevel != fanLevel ) {
         			log.info "Fan Only, ${fanLevel}% vent"
         			ventSwitch.setLevel(fanLevel as Integer)
@@ -446,6 +523,13 @@ def checkOperatingStates() {
             }
         }
     	else if (activeNow == 2) {
+            if (pollTstats) {				
+            	if (pollSwitch) {
+                	if (pollSwitch.currentSwitch != 'on') { 
+                    	pollSwitch.on()
+                    }
+                }
+            }
 			if (stateNow == 'cooling') {
             	def coolLevel = minVent				// no cooling unless we're managing the temperature
                 if (manageTemp) {
@@ -510,15 +594,17 @@ def checkOperatingStates() {
 def tempHandler(evt) {
 	log.trace "tempHandler $evt.displayName $evt.name: $evt.value"
     
-    Integer pollFreq = 181		// Minimum poll is 3 minutes - we add a little to accomodate network delays
+    Integer pollFreq = state.fastPollSecs		// Minimum poll is 3 minutes - we add a little to accomodate network delays
     
     atomicState.timeHandlerLast = false
 
 // Limit polls to no more than 1 per $pollFreq (3) minutes (if required: Nest & Ecobee require, native Zwave typically don't)
 	if (pollTstats && secondsPast( state.lastPoll, pollFreq)) {
-    	log.trace 'tempHandler polling'
-        pollThermostats() 
-        runIn( pollFreq, timeHandler, [overwrite: true] )	// schedule a timed poll in no less than 5 minutes after this one
+//    	if ((!pollSwitch) || (pollSwitch && (pollSwitch.currentSwitch == 'on'))) {
+    		log.trace 'tempHandler polling'
+        	pollThermostats() 
+        	runIn( pollFreq, timeHandler, [overwrite: true] )	// schedule a timed poll in no less than 5 minutes after this one
+//        }
     }
 
 // if we are managing the temperature or humidity, check if we've reached the target when either changes
@@ -557,19 +643,28 @@ def timeHandler() {
     if (pollTstats) { 
         pollThermostats()
         
-        Integer delayPoll = 181					// Minimum poll time is 3 minutes
+        Integer delayPoll = state.slowPollSecs					// Minimum poll time is 3 minutes
         	
         if (thermostatOne.currentThermostatOperatingState == 'idle') {
         	if (thermostatTwo) {
-            	if (thermostatTwo.currentThermostatOperatingState == 'idle') {
-                	delayPoll = delayPoll * 2					// both are idle - long wait (unless something changes)
+            	if (thermostatTwo.currentThermostatOperatingState == 'idle') {   
+                    delayPoll = delayPoll * 2					// both are idle - long wait (unless something changes)
                 }
             }
             else {
             	delayPoll = delayPoll * 2					// no thermostatTwo and thermostatOne is idle - long wait
             }
-        }                
+        }
+        if (pollSwitch) {
+        	if (pollSwitch.currentSwitch != 'on') { 
+            	return 
+          	}	// pollSwitch is off - stop scheduling polls
+            else {
+            	delayPoll = state.slowPollSecs
+            }
+        }
         runIn( delayPoll, timeHandler, [overwrite: true] )  // schedule the next poll
+ 	
     }
 }
 
